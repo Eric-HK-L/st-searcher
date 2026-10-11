@@ -505,16 +505,19 @@ def score_candidate(video, cand, idf=None, ignore_episode=False):
                 why.append(f"中文片名匹配「{phrase}」")
                 break
 
-    # L2 剧名 + 季（+集）
-    if level < 2 and cand["season"] is not None:
-        season_ok = cand["season"] == video["season"]
-        if ignore_episode:
-            ep_ok = True
-        else:
-            ep_ok = cand["episode"] == video["episode"]
-        if video["season"] is not None and season_ok and ep_ok:
-            s_tok = v_series or v_title
-            if s_tok and c_series:
+    # L2 剧名（+季集）
+    if level < 2:
+        s_tok = v_series or v_title
+        if video["season"] is None:
+            # 只给了剧名（没写季号）：剧名对上就算 L2。
+            # 这一条还负责把「中文名搜到的剧」和「英文名发布」的条目接起来。
+            if s_tok and c_series and _series_match_score(s_tok, c_series, idf) >= 0.75:
+                level = max(level, 2)
+                why.append("剧名匹配")
+        elif cand["season"] is not None:
+            season_ok = cand["season"] == video["season"]
+            ep_ok = True if ignore_episode else cand["episode"] == video["episode"]
+            if season_ok and ep_ok and s_tok and c_series:
                 if _series_match_score(s_tok, c_series, idf) >= 0.75:
                     level = max(level, 2)
                     tail = (f"S{video['season']:02d}" if ignore_episode
@@ -762,6 +765,7 @@ def season_groups(con, video, season=None, lang_pref=None):
         return []
     cands = find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True,
                             sql_cap=60000)
+    cands = _augment_by_series(con, v, cands, lang_pref, ignore_episode=True)
     if getattr(cands, "truncated", False):
         print(f"⚠️  第 {v['season']} 季的候选行数触到了数据库上限，可能有遗漏。",
               file=sys.stderr)
@@ -792,6 +796,103 @@ def season_groups(con, video, season=None, lang_pref=None):
     order = [primary] + [g for g in groups if g is not primary]
     order[0]["primary"] = True
     return order
+
+
+def _augment_by_series(con, video, cands, lang_pref=None, ignore_episode=False):
+    """用第一轮命中的 series_key 再补一轮，补上「文件名是另一种语言」的条目。
+
+    为什么需要：SQL 的检索阶梯是分语言的 ——
+      · 搜中文「黑镜」走的是 `cnname LIKE '%黑镜%'`，只能捞到**打了中文名的归档**；
+        而另一些归档文件名是英文（Black.Mirror.S03E04...）且没进元数据，就漏了。
+      · 反过来，搜英文 `black.mirror` 走 `series_key = ...`，又会漏掉中文命名的。
+    拿第一轮结果里出现过的 series_key 再查一次，两边就能合起来。
+    """
+    if not cands:
+        return cands
+    seen = {(c["fullpath"], c["inner_path"]) for c in cands}
+    keys = Counter(c["series_key"] for c in cands if c.get("series_key"))
+    out = list(cands)
+    for sk, _n in keys.most_common(3):
+        if not sk or sk == (video.get("series_key") or ""):
+            continue
+        v2 = dict(video)
+        v2["series_key"] = sk
+        v2["title_key"] = sk
+        v2["title_toks"] = [t for t in sk.split(".") if t]
+        for c in find_candidates(con, v2, lang_pref=lang_pref,
+                                 ignore_episode=ignore_episode, sql_cap=60000):
+            k = (c["fullpath"], c["inner_path"])
+            if k not in seen:
+                seen.add(k)
+                out.append(c)
+    out.sort(key=lambda r: (-r["_score"], r["inner_path"]))
+    return CandidateList(out, truncated=False)
+
+
+def _label_from_cands(cands, fallback):
+    for c in cands:
+        if c.get("cnname"):
+            return c["cnname"]
+    for c in cands:
+        if c.get("enname"):
+            return c["enname"]
+    return (fallback or "").replace(".", " ")
+
+
+def _season_packs(pairs):
+    """找出「一个归档里覆盖了 ≥2 集」的归档 —— 那就是一份现成的整季包。
+
+    数据里确实存在这种：一个 rar/zip 装着整季的字幕文件。
+    直接下原档比逐集取要省事得多。
+
+    返回 [(fullpath, 集号集合, 代表候选), ...]，按覆盖集数降序。
+    """
+    arch = {}
+    for ep, cands in pairs:
+        for c in cands:
+            arch.setdefault(c["fullpath"], {"eps": set(), "c": c})["eps"].add(ep)
+    packs = [(fp, v["eps"], v["c"]) for fp, v in arch.items() if len(v["eps"]) >= 2]
+    packs.sort(key=lambda x: (-len(x[1]), x[0]))
+    return packs
+
+
+def series_overview(con, video, lang_pref=None):
+    """按剧名检索 -> 按季汇总，主分组在前。
+
+    返回 [{"series_key","label","seasons":[(season, pairs, packs)],"primary"}, ...]
+    没有季集信息的结果（电影等）不参与汇总。
+    """
+    v = dict(video)
+    v["season"] = None
+    v["episode"] = None
+    cands = find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True,
+                            sql_cap=60000)
+    cands = _augment_by_series(con, v, cands, lang_pref, ignore_episode=True)
+
+    by_series = {}
+    for c in cands:
+        if c["season"] is None:
+            continue
+        by_series.setdefault(c["series_key"] or "", {}) \
+                 .setdefault(c["season"], {}) \
+                 .setdefault(c["episode"], []).append(c)
+
+    groups = []
+    for sk, seasons in by_series.items():
+        seasons_out = []
+        for se in sorted(seasons):
+            pairs = sorted(seasons[se].items())
+            seasons_out.append((se, pairs, _season_packs(pairs)))
+        flat = [c for _se, pairs, _pk in seasons_out for _ep, cs in pairs for c in cs]
+        groups.append({"series_key": sk, "label": _label_from_cands(flat, sk),
+                       "seasons": seasons_out, "primary": False})
+    if not groups:
+        return []
+    groups.sort(key=lambda g: -sum(len(p) for _s, p, _k in g["seasons"]))
+    exact = [g for g in groups if g["series_key"] == (v.get("series_key") or "")]
+    primary = exact[0] if exact else groups[0]
+    primary["primary"] = True
+    return [primary] + [g for g in groups if g is not primary]
 
 
 def find_season(con, video, season=None, lang_pref=None):
@@ -1324,6 +1425,25 @@ a.pack:hover{background:var(--accent-h)}
 .ver .badge{min-width:40px;font-size:11.5px;padding:2px 6px}
 .ver .act a.dl{padding:5px 11px;font-size:12.5px}
 
+/* 视图切换 / 季列表 / 整季包 */
+.tabs{display:flex;gap:4px;margin:0 0 14px;border-bottom:1px solid var(--line)}
+.tab{text-decoration:none;color:var(--fg2);padding:8px 16px;border-radius:9px 9px 0 0;
+  font-size:14px;border:1px solid transparent;border-bottom:0;margin-bottom:-1px}
+.tab:hover{color:var(--fg);background:var(--input)}
+.tab.on{background:var(--card);border-color:var(--line);color:var(--fg);font-weight:600}
+.seasrow{display:flex;gap:12px;align-items:center;padding:12px 15px;margin-bottom:8px;
+  background:var(--card);border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow)}
+.seasrow .sno{font-weight:700;color:var(--link);font-family:ui-monospace,Menlo,monospace;
+  min-width:56px;font-size:14px}
+.seasrow .sinfo{flex:1;color:var(--fg3);font-size:13px;min-width:0}
+.packrow{display:flex;gap:12px;align-items:center;padding:12px 15px;margin-bottom:8px;
+  background:var(--card);border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow)}
+.packrow .pinfo{flex:1;min-width:0}
+.packrow .pname{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--fg2);
+  word-break:break-all}
+.packrow .pmeta{color:var(--fg4);font-size:12px;margin-top:3px}
+.packrow .badge{min-width:52px}
+
 /* 分页 */
 .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:center;
   padding:18px 0 6px}
@@ -1466,7 +1586,10 @@ a.pack:hover{background:var(--accent-h)}
         body = []
         base = {"q": series_q, "season": season, "lang": lang, "all": 1 if show_all else 0,
                 "per": per}
+        if theme:
+            base["theme"] = theme
         zq = urllib.parse.urlencode({"q": series_q, "season": season, "lang": lang})
+        body.append(_tabs(series_q, lang, season, "ep", theme))
         body.append(
             f'<div class="banner"><div><b>《{html.escape(label)}》第 {season} 季 —— '
             f'{len(pairs)} 集 / {n_ver} 个版本</b>'
@@ -1519,6 +1642,97 @@ a.pack:hover{background:var(--accent-h)}
                 f'点开看看：<br>{" ".join(alts)}</div>')
         return _shell(q, lang, body, theme)
 
+    def _tabs(q, lang, season, active, theme=None):
+        base = {"q": q, "season": season, "lang": lang}
+        if theme:
+            base["theme"] = theme
+
+        def one(view, label):
+            d = dict(base)
+            d["view"] = view
+            cls = "tab on" if view == active else "tab"
+            return f'<a class="{cls}" href="/?{urllib.parse.urlencode(d)}">{label}</a>'
+        return f'<div class="tabs">{one("pack", "整季包")}{one("ep", "按集")}</div>'
+
+    def render_series(q, lang, overview, theme=None):
+        """剧名检索：按季列出，每季给「整季包」「按集」两个入口。"""
+        g = overview[0]
+        n_ep = sum(len(p) for _s, p, _k in g["seasons"])
+        n_f = sum(len(c) for _s, p, _k in g["seasons"] for _e, cs in p for c in cs)
+        n_pk = sum(len(k) for _s, _p, k in g["seasons"])
+
+        body = [f'<div class="banner"><div><b>《{html.escape(g["label"])}》</b>'
+                f'<small>共 {len(g["seasons"])} 季 · {n_ep} 集 · {n_f} 个文件'
+                f' · {n_pk} 个现成整季包</small></div></div>']
+
+        for se, pairs, packs in g["seasons"]:
+            nf = sum(len(c) for _e, c in pairs)
+            sq = urllib.parse.urlencode({"q": g["series_key"] or q, "season": se,
+                                         "lang": lang})
+            sq_ep = urllib.parse.urlencode({"q": g["series_key"] or q, "season": se,
+                                            "lang": lang, "view": "ep"})
+            pack_txt = (f'{len(packs)} 个整季包' if packs else '无现成整季包')
+            body.append(
+                f'<div class="seasrow"><span class="sno">S{se:02d}</span>'
+                f'<span class="sinfo">{len(pairs)} 集 · {nf} 个文件 · {pack_txt}</span>'
+                f'<a class="dl" href="/?{sq}&view=pack">整季包</a>'
+                f'<a class="dl alt" href="/?{sq_ep}">按集</a></div>')
+
+        if len(overview) > 1:
+            alts = []
+            for o in overview[1:6]:
+                aq = urllib.parse.urlencode({"q": o["series_key"], "lang": lang})
+                alts.append(f'<a class="pg" href="/?{aq}">《{html.escape(o["label"])}》'
+                            f' {len(o["seasons"])} 季</a>')
+            body.append(f'<div class="hint" style="margin-top:18px">⚠️ 「{html.escape(q)}」'
+                        f'还匹配到 {len(overview) - 1} 个相近的分组，可能不是同一部剧：<br>'
+                        f'{" ".join(alts)}</div>')
+        return _shell(q, lang, body, theme)
+
+    def render_pack(q, lang, video, season, group, theme=None):
+        """整季包视图：列出覆盖多集的原始归档 + 生成整合包。"""
+        pairs = group["pairs"]
+        label = group["label"]
+        series_q = group["series_key"] or q
+        packs = _season_packs(pairs)
+        n_ver = sum(len(c) for _e, c in pairs)
+        ep_all = sorted(e for e, _c in pairs)
+
+        body = [_tabs(series_q, lang, season, "pack", theme)]
+        zq = urllib.parse.urlencode({"q": series_q, "season": season, "lang": lang})
+        body.append(
+            f'<div class="banner"><div><b>《{html.escape(label)}》第 {season} 季 —— '
+            f'{len(packs)} 个现成整季包</b>'
+            f'<small>这些是「一个归档里装了多集」的原档，直接下最省事；'
+            f'下方也可以让本工具现拼一个整季 zip</small></div>'
+            f'<div class="acts">'
+            f'<a class="pack" href="/season.zip?{zq}">⬇︎ 现拼（每集推荐版）</a>'
+            f'<a class="pack" style="background:var(--input);color:var(--fg2);'
+            f'border:1px solid var(--line2)" href="/season.zip?{zq}&amp;all=1">'
+            f'现拼（全部 {n_ver} 个版本）</a></div></div>')
+
+        if packs:
+            for fp, eps, c in packs:
+                miss = sorted(set(ep_all) - eps)
+                cov = f'覆盖 {len(eps)}/{len(ep_all)} 集'
+                if miss:
+                    cov += f'（缺 {", ".join(f"E{m:02d}" for m in miss[:8])}' + \
+                           ('…' if len(miss) > 8 else '') + '）'
+                size = f'{c["size"]:,} B' if (c["size"] or 0) > 0 else '—'
+                aq = urllib.parse.urlencode({"fp": fp})
+                body.append(
+                    f'<div class="packrow"><span class="badge l3">整季包</span>'
+                    f'<div class="pinfo"><div class="pname">{html.escape(fp)}</div>'
+                    f'<div class="pmeta">{cov} · {size} · {html.escape(c["ext"] or "")}'
+                    f' · {html.escape((c["cnname"] or c["enname"] or "")[:40])}</div></div>'
+                    f'<span class="act"><a class="dl" href="/archive?{aq}">下载原档</a>'
+                    f'</span></div>')
+        else:
+            body.append('<div class="hint">这一季没有「一个归档装多集」的原档，'
+                        '可以用上面的按钮现拼一个。</div>')
+
+        return _shell(q, lang, body, theme)
+
     # ------------------------------------------------------------------
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1563,6 +1777,24 @@ a.pack:hover{background:var(--accent-h)}
                 self._send(data, "application/zip", f"S{int(season):02d}.zip")
                 return
 
+            if u.path == "/archive":
+                fp = qs.get("fp", [""])[0]
+                if not fp or "/" not in fp:
+                    self.send_error(400, "missing fp")
+                    return
+                coll = fp.split("/")[0]
+                z = dict(open_archives(coll)).get(coll)
+                if z is None:
+                    self.send_error(404, "archive not found")
+                    return
+                try:
+                    data = z.read(fp)
+                except Exception as e:
+                    self.send_error(500, str(e))
+                    return
+                self._send(data, "application/octet-stream", Path(fp).name)
+                return
+
             if u.path == "/get":
                 fullpath = qs.get("fp", [""])[0]
                 inner = qs.get("ip", [""])[0]
@@ -1601,24 +1833,46 @@ a.pack:hover{background:var(--accent-h)}
             pref = {lang} if lang else None
             page = self._int(qs, "page", 1)
 
-            # 整季模式：查询里带季、不带集
-            if v["season_only"]:
-                groups = season_groups(state["con"], v, v["season"], pref)
+            # 1) 指定了季号（来自 URL 的 season=，或查询词里自带）-> 整季视图
+            season_param = (qs.get("season", [""])[0] or "").strip()
+            want_season = int(season_param) if season_param.isdigit() else v["season"]
+            if want_season is not None and v["episode"] is None:
+                sv = dict(v)
+                sv["season"] = want_season
+                sv["episode"] = None
+                groups = season_groups(state["con"], sv, want_season, pref)
                 if groups:
+                    view = (qs.get("view", ["ep"])[0] or "ep").lower()
+                    if view == "pack":
+                        self._send(render_pack(q, lang, sv, want_season, groups[0], theme),
+                                   "text/html; charset=utf-8")
+                        return
                     show_all = qs.get("all", ["1"])[0] != "0"
-                    per = self._int(qs, "per", SEASON_PER)
-                    per = min(per, 60)
-                    self._send(render_season(q, lang, v, v["season"], groups,
+                    per = min(self._int(qs, "per", SEASON_PER), 60)
+                    self._send(render_season(q, lang, sv, want_season, groups,
                                              page=page, per=per, show_all=show_all,
                                              theme=theme),
                                "text/html; charset=utf-8")
                     return
-                note = (f"解析：“{html.escape(q)}” → 第 {v['season']} 季，"
-                        f"但没有找到整季记录，下面按名字列出全部结果")
-                rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)
-                self._send(render(q, lang, rows, note, page=page, theme=theme),
-                           "text/html; charset=utf-8")
-                return
+
+            # 2) 只有剧名（没有季集）-> 按季总览
+            if v["season"] is None and (v["series_key"] or v.get("cjk")):
+                overview = series_overview(state["con"], v, pref)
+                if len(overview) == 1 and len(overview[0]["seasons"]) == 1:
+                    # 只有一季就别多一层了，直接进按集视图
+                    se, pairs, _pk = overview[0]["seasons"][0]
+                    one = dict(overview[0])
+                    one["pairs"] = pairs
+                    self._send(render_season(q, lang, v, se, [one],
+                                             page=page, per=min(self._int(qs, "per", SEASON_PER), 60),
+                                             show_all=qs.get("all", ["1"])[0] != "0",
+                                             theme=theme),
+                               "text/html; charset=utf-8")
+                    return
+                if len(overview[0]["seasons"]) >= 2:
+                    self._send(render_series(q, lang, overview, theme),
+                               "text/html; charset=utf-8")
+                    return
 
             rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)
             ep_txt = ""
