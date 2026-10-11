@@ -27,6 +27,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -315,19 +316,68 @@ def _write_archives(rows, db_path, csv_out, meta_used):
 # --------------------------------------------------------------------------
 # scan-inner
 # --------------------------------------------------------------------------
+# bsdtar -tvf 的日期列：老文件是 "Mar 15  2008"，新的是 "Mar 15 12:34"，
+# 也有 ISO 风格的 "2020-01-01 12:34"。名字在日期之后。
+_BSDTAR_DATE = re.compile(
+    r"^(?:[A-Za-z]{3}\s+\d{1,2}\s+(?:\d{4}|\d{2}:\d{2})"
+    r"|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s+")
+
+
+def _bsdtar_rows(path: str):
+    """bsdtar -tvf -> [(名字, 大小)]；格式不认识就 None。
+
+    形如：-rw-r--r--  0 0      0      220030 Mar 15  2008 名字.ass
+    日期列长度不固定（老文件 Mar 15  2008 / 新文件 Mar 15 12:34 / ISO 格式），
+    所以按正则剥。剥不掉就整体放弃，宁可退化也绝不把日期混进文件名 ——
+    那样下载会 404。
+
+    注意不能因为 returncode != 0 就丢弃输出：固实 rar 会报
+    "RAR solid archive support unavailable" 并返回 1，但目录列表是好的。
+    """
+    out = subprocess.run(["bsdtar", "-tvf", path], capture_output=True, timeout=180)
+    rows = []
+    for line in out.stdout.decode("utf-8", errors="replace").splitlines():
+        if not line or line.startswith("total "):
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            if line.rstrip().endswith("/"):
+                continue                     # 目录
+            return None
+        mode, size, rest = parts[0], parts[4], parts[5]
+        if mode[:1] in ("d", "l", "b", "c", "p"):     # 目录 / 链接 / 设备
+            continue
+        m = _BSDTAR_DATE.match(rest)
+        if not m:
+            return None
+        name = rest[m.end():].rstrip()
+        if not name:
+            continue
+        try:
+            rows.append((name, int(size)))
+        except ValueError:
+            rows.append((name, -1))
+    return rows or None
+
+
+def _bsdtar_names(path: str):
+    """退路：只列名字，大小记 -1（界面上显示「大小未知」）。"""
+    out = subprocess.run(["bsdtar", "-tf", path], capture_output=True, timeout=180)
+    names = out.stdout.decode("utf-8", errors="replace").splitlines()
+    rows = [(n.rstrip("/"), -1) for n in names if n and not n.endswith("/")]
+    return rows or None
+
+
 def _list_with_bsdtar(blob: bytes, suffix: str):
-    """rar / 7z 等交给 libarchive(bsdtar) 读取目录。"""
+    """rar / 7z 等交给 libarchive(bsdtar) 读取目录，带回每个文件的大小。"""
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     try:
         tmp.write(blob)
         tmp.close()
-        out = subprocess.run(
-            ["bsdtar", "-tf", tmp.name], capture_output=True, timeout=120
-        )
-        if out.returncode != 0:
-            return None
-        names = out.stdout.decode("utf-8", errors="replace").splitlines()
-        return [(n.rstrip("/"), -1) for n in names if n and not n.endswith("/")]
+        rows = _bsdtar_rows(tmp.name)
+        if rows is None:
+            rows = _bsdtar_names(tmp.name)       # 退化成只有名字
+        return rows
     except Exception:
         return None
     finally:

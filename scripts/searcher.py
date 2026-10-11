@@ -216,6 +216,84 @@ def classify_lang(marks):
     return ""
 
 
+# 「特别篇」的写法。要求关键词是独立 token（前后是分隔符/行尾/紧跟数字），
+# 否则 NOVA、SPecial Edition 之类会被误伤。
+_SP_TOKEN_RE = re.compile(
+    r"(?:^|[.\s_\[(-])(special|sp|ova|oad|特典|特别篇|特別篇|番外篇|番外|剧场版|劇場版)"
+    r"(?=[.\s_\])-]|$|\d)", re.I)
+
+# "Special Edition" / "特别版" 是版本说明，不是特别篇
+_SP_NOT_EDITION_RE = re.compile(r"[.\s_-]*(edition|版本?|collector|collectors)", re.I)
+
+
+def parse_special(text: str):
+    """识别特别篇，返回 (0, 编号或 None)；不是特别篇则返回 (None, None)。
+
+    只在正常季集解析失败后才调用 —— 否则 Lost.S01E14.Special 这种
+    （Special 是那一集的标题）会被误判。
+
+    季号一律记 0，与数据里本来就有的 S00Exx 写法保持一致（Plex/Jellyfin 约定）。
+    """
+    m = _SP_TOKEN_RE.search(text)
+    if not m:
+        return None, None
+    if _SP_NOT_EDITION_RE.match(text[m.end():]):
+        return None, None
+    tail = text[m.end():]
+    mm = re.match(r"\s*(\d{1,3})", tail)
+    return 0, int(mm.group(1)) if mm else None
+
+
+def special_key(base: str, m, series_key: str) -> str:
+    """一条特别篇的稳定标识 —— 用来把「同一集特别篇的不同语言/容器」归到一组。
+
+    规则：取关键词之后、直到第一个画质噪声词为止的 token。
+    开头若紧跟年份（…Special.2011.720p…）则跳过，这样 2011 和 2012 两集圣诞特别篇
+    不会混在一起。关键词后面什么都没有时（Skins…Secret.Party.Special），
+    退回用关键词之前的 token，并去掉属于剧名的那部分。
+    """
+    toks = []
+    for t in norm_key(base[m.end():]).split("."):
+        if not t:
+            continue
+        if not toks and re.fullmatch(r"(?:19|20)\d{2}", t):
+            continue                      # 跳过紧跟在关键词后的年份
+        # 碰到画质/噪声词就结束 —— 后面的发布组（-SHORTBREHD 之类）不算标题。
+        # 这里必须是 break 而不是 continue：否则「…Special.720p.BluRay.x264-SHORTBREHD」
+        # 会把前面的噪声全跳过，最后只取到发布组名 shortbrehd。
+        if t in _NOISE or _EP_TOKEN_RE.match(t):
+            break
+        if t in STOPWORDS:
+            continue                      # "From the Beginning" 这种，别在 From 就断
+        toks.append(t)
+    if not toks:
+        # 关键词后面没内容（…Christmas.Special.720p…）—— 用前面紧邻的两个词
+        cand = [t for t in norm_key(base[:m.start()]).split(".")
+                if t and t not in _NOISE and not _EP_TOKEN_RE.match(t)]
+        toks = cand[-2:]
+    return ".".join(toks)
+
+
+def _special_head(base: str, sp_start: int) -> str:
+    """特别篇的文件名 -> 剧名部分。
+
+    Black.Mirror.S02.Special.White.Christmas  -> Black.Mirror
+    Downton.Abbey.S05.Christmas.Special.720p  -> Downton.Abbey
+    downton.abbey.christmas.special.2011      -> downton.abbey.christmas（没季号可切）
+
+    有季号就切在最后一个季号上，否则切在关键词处。
+    """
+    before = base[:sp_start]
+    sm = None
+    for sm in _SEASON_ONLY_RE.finditer(before):
+        pass
+    if sm:
+        head = before[: sm.start()]
+    else:
+        head = before
+    return re.sub(r"[.\s_-]*s\d{1,2}$", "", head, flags=re.I).strip(" ._-")
+
+
 def parse_episode(text: str):
     m = _EP_RE.search(text)
     if m:
@@ -331,7 +409,8 @@ CREATE TABLE IF NOT EXISTS subs (
     season      INTEGER,
     episode     INTEGER,
     lang        TEXT,
-    is_bare     INTEGER DEFAULT 0
+    is_bare     INTEGER DEFAULT 0,
+    special_key TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_subs_ep    ON subs(season, episode);
 CREATE INDEX IF NOT EXISTS ix_subs_skey  ON subs(series_key);
@@ -358,9 +437,18 @@ def build_subs(db_path=DB_PATH, verbose=True):
         season, episode = parse_episode(stem)
 
         head = base
+        sp_key = ""
         m = _EP_RE.search(base)
         if m:
             head = base[: m.start()]
+        else:
+            # 没有正常季集号：再看是不是特别篇（Skins.S01.Special / 某剧 SP / 特别篇）
+            sp_season, sp_ep = parse_special(base)
+            if sp_season is not None:
+                season, episode = sp_season, sp_ep
+                sm = _SP_TOKEN_RE.search(base)
+                head = _special_head(base, sm.start())
+                sp_key = special_key(base, sm, norm_key(head))
 
         rel = norm_key(base)
         skey = norm_key(head)
@@ -369,13 +457,13 @@ def build_subs(db_path=DB_PATH, verbose=True):
                 and t not in STOPWORDS
                 and not re.fullmatch(r"(?:19|20)\d{2}", t)]
         buf.append((fullpath, searchable, ext, size, rel, skey, ".".join(toks),
-                    season, episode, lang, is_bare))
+                    season, episode, lang, is_bare, sp_key))
         n += 1
         if len(buf) >= 20000:
             cur.executemany(
                 "INSERT INTO subs (fullpath,inner_path,ext,size,release_key,"
-                "series_key,title_key,season,episode,lang,is_bare) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", buf)
+                "series_key,title_key,season,episode,lang,is_bare,special_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", buf)
             buf.clear()
 
     for fullpath, inner_path, ext, size in con.execute(
@@ -396,8 +484,52 @@ def build_subs(db_path=DB_PATH, verbose=True):
     if buf:
         cur.executemany(
             "INSERT INTO subs (fullpath,inner_path,ext,size,release_key,"
-            "series_key,title_key,season,episode,lang,is_bare) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", buf)
+            "series_key,title_key,season,episode,lang,is_bare,special_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", buf)
+    # 特别篇常常只有一个名字（Special / SP / 白色圣诞），没有编号。
+    # 按 (剧, 特别篇标识) 去重后排序编号 —— 同一个特别篇的不同语言/容器
+    # 必须落在同一个编号里，否则「白色圣诞」的 4 种语言会变成 4 集。
+    con.execute("""
+        WITH mx AS (
+            SELECT series_key, COALESCE(MAX(episode), 0) m FROM subs
+            WHERE season = 0 AND episode IS NOT NULL GROUP BY series_key
+        ),
+        uniq AS (
+            SELECT DISTINCT series_key, special_key FROM subs
+            WHERE season = 0 AND episode IS NULL AND special_key <> ''
+        ),
+        ranked AS (
+            SELECT series_key, special_key,
+                   ROW_NUMBER() OVER (PARTITION BY series_key ORDER BY special_key) rn
+            FROM uniq
+        ),
+        t AS (
+            SELECT s.rowid rid,
+                   COALESCE(mx.m, 0) + r.rn AS ep
+            FROM subs s
+            JOIN ranked r ON r.series_key = s.series_key
+                         AND r.special_key = s.special_key
+            LEFT JOIN mx ON mx.series_key = s.series_key
+            WHERE s.season = 0 AND s.episode IS NULL AND s.special_key <> ''
+        )
+        UPDATE subs SET episode = (SELECT ep FROM t WHERE t.rid = subs.rowid)
+        WHERE rowid IN (SELECT rid FROM t)
+    """)
+    # 兜底：既没编号也没标识的，按剧顺次补，别留在 NULL
+    con.execute("""
+        WITH mx AS (
+            SELECT series_key, COALESCE(MAX(episode), 0) m FROM subs
+            WHERE season = 0 AND episode IS NOT NULL GROUP BY series_key
+        ),
+        t AS (
+            SELECT s.rowid rid, COALESCE(mx.m, 0) + ROW_NUMBER() OVER (
+                       PARTITION BY s.series_key ORDER BY s.inner_path) rn
+            FROM subs s LEFT JOIN mx ON mx.series_key = s.series_key
+            WHERE s.season = 0 AND s.episode IS NULL
+        )
+        UPDATE subs SET episode = (SELECT rn FROM t WHERE t.rid = subs.rowid)
+        WHERE rowid IN (SELECT rid FROM t)
+    """)
     con.commit()
 
     # 中文名不复制到 subs：archives.fullpath 是主键，查询时 JOIN 即可，
@@ -742,6 +874,21 @@ def _group_label(pairs, fallback):
                         [c.get("enname") for c in flat], fallback)
 
 
+def season_title(season):
+    """季号 -> 显示名。0 是特别篇（跟数据里 S00Exx 的写法一致）。"""
+    return "特别篇" if season == 0 else f"第 {season} 季"
+
+
+def fmt_size(n):
+    """字节数 -> 人可读。字幕都很小，所以最小单位用 KB，不用 B。"""
+    if not n or n < 0:              # -1 是「归档格式拿不到大小」的占位，0 按没有处理
+        return "大小未知"
+    if n < 1024 * 1024:
+        kb = n / 1024
+        return f"{kb:.1f} KB" if kb < 100 else f"{kb:.0f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
 def _common_prefix(strs):
     """最长公共前缀（大小写不敏感）。
 
@@ -857,7 +1004,7 @@ def season_versions(con, video, season=None, lang_pref=None):
                     "n_files": sum(v["n"] for v in langs.values())})
     out.sort(key=lambda x: (-x["coverage"], -x["n_files"], x["family"]))
     # 只保留能覆盖到 2 集以上的版本；零散单集不算「整季」
-    out = [x for x in out if x["coverage"] >= 2]
+    out = [x for x in out if x["coverage"] >= min(2, total)]
     # 各版本名共同的开头就是剧名，剥掉它，只留「720p.WEB-DL…」这种区分信息。
     # 注意别把画质标记也剥掉 —— 公共前缀可能一直延伸到「…720p.」，
     # 所以遇到第一个画质词就停。
@@ -871,6 +1018,45 @@ def season_versions(con, video, season=None, lang_pref=None):
     else:
         for x in out:
             x["short"] = x["label"]
+    return out
+
+
+def _specials_pairs(con, video, lang_pref=None):
+    """一部剧的特别篇，按「特别篇标识」分组 -> [(序号, [候选...]), ...]。
+
+    用 season = 0 表示特别篇 —— 数据里本来就用 S00Exx 这么写
+    （Deadwood.S00E01 / Euphoria.US.S00E01），跟 Plex、Jellyfin 的约定一致。
+
+    特别篇的 series_key 未必和正片完全相同：Downton.Abbey.Christmas.Special
+    会被切成 downton.abbey.christmas，所以这里用前缀匹配再兜一层。
+    """
+    sk = (video.get("series_key") or "").strip()
+    if not sk:
+        return []
+    rows = con.execute(
+        "SELECT s.*, a.cnname, a.enname FROM subs s"
+        " LEFT JOIN archives a ON a.fullpath = s.fullpath"
+        " WHERE s.season = 0 AND (s.series_key = ? OR s.series_key LIKE ?)"
+        " ORDER BY s.special_key, s.inner_path",
+        (sk, sk + ".%")).fetchall()
+    if not rows:
+        return []
+    buckets = {}
+    for r in rows:
+        d = dict(r)
+        buckets.setdefault(d.get("special_key") or d["inner_path"], []).append(d)
+    out = []
+    for i, key in enumerate(sorted(buckets), 1):
+        cands = buckets[key]
+        for c in cands:
+            c["_level"] = 2                 # 同一个 series_key 前缀，直接算剧名匹配
+            c["_score"] = 1.0
+            c["_why"] = "特别篇"
+        if lang_pref:
+            cands.sort(key=lambda c: (c["lang"] not in lang_pref, c["inner_path"]))
+        else:
+            cands.sort(key=lambda c: c["inner_path"])
+        out.append((i, cands))
     return out
 
 
@@ -890,8 +1076,8 @@ def series_overview(con, video, lang_pref=None):
 
     by_series = {}
     for c in cands:
-        if c["season"] is None:
-            continue
+        if c["season"] is None or c["season"] == 0:
+            continue          # 特别篇单独追加，不参与按季分组
         by_series.setdefault(c["series_key"] or "", {}) \
                  .setdefault(c["season"], {}) \
                  .setdefault(c["episode"], []).append(c)
@@ -913,10 +1099,40 @@ def series_overview(con, video, lang_pref=None):
     exact = [g for g in groups if g["series_key"] == (v.get("series_key") or "")]
     primary = exact[0] if exact else groups[0]
     primary["primary"] = True
+
+    # 特别篇（season=0）。它们的 series_key 未必和正片一致
+    # （Downton.Abbey.Christmas.Special -> downton.abbey.christmas），
+    # 所以这里用主分组的 series_key 去前缀匹配，找到后并进季列表，排在最后。
+    sv = dict(v)
+    sv["series_key"] = primary["series_key"]
+    sp = _specials_pairs(con, sv, lang_pref)
+    if sp:
+        primary["seasons"] = primary["seasons"] + [
+            (0, sp, season_versions(con, sv, 0, lang_pref))]
+
     return [primary] + [g for g in groups if g is not primary]
 
 
 def season_groups(con, video, season=None, lang_pref=None):
+    if season == 0:                       # 特别篇
+        pairs = _specials_pairs(con, video, lang_pref)
+        if not pairs:
+            return []
+        sk = video.get("series_key") or ""
+        label = _group_label(pairs, sk)
+        if label == sk.replace(".", " "):
+            # 特别篇归档常常没有中文名（尤其中间那批没元数据的），
+            # 这时借用正片的名字，免得标题显示成 "black mirror"。
+            rows = con.execute(
+                "SELECT a.cnname, a.enname FROM subs s"
+                " LEFT JOIN archives a ON a.fullpath = s.fullpath"
+                " WHERE s.series_key = ? AND s.season > 0"
+                " AND (a.cnname IS NOT NULL OR a.enname IS NOT NULL) LIMIT 400",
+                (sk,)).fetchall()
+            if rows:
+                label = series_label([r[0] for r in rows], [r[1] for r in rows], sk)
+        return [{"series_key": sk, "label": label, "pairs": pairs,
+                 "primary": True, "specials": True}]
     """整季检索，返回按剧集分组的列表（主组在第一个）。
 
     [{"series_key", "label", "pairs": [(ep, [候选...]), ...], "primary": bool}, ...]
@@ -1081,9 +1297,29 @@ def materialize(con, cand, dest: Path):
                 tmp = os.path.join(tmpd, "a" + ext)
                 with open(tmp, "wb") as f:
                     f.write(blob)
-                subprocess.run(["bsdtar", "-xf", tmp, "-C", tmpd, target],
-                               check=True, timeout=300)
-                with open(os.path.join(tmpd, target), "rb") as f:
+                # 先按名字单独取。固实 rar 不支持按名字取
+                # （bsdtar 报 "RAR solid archive support unavailable"），
+                # 这时退化为整包解开再从目录里找。
+                r = subprocess.run(["bsdtar", "-xf", tmp, "-C", tmpd, target],
+                                   capture_output=True, timeout=300)
+                got = os.path.join(tmpd, target)
+                if r.returncode != 0 or not os.path.exists(got):
+                    subprocess.run(["bsdtar", "-xf", tmp, "-C", tmpd],
+                                   capture_output=True, timeout=900)
+                if not os.path.exists(got):
+                    want = os.path.basename(target)
+                    hit = None
+                    for root, _dirs, files in os.walk(tmpd):
+                        for f in files:
+                            if f == want or fix_cp437(f) == want:
+                                hit = os.path.join(root, f)
+                                break
+                        if hit:
+                            break
+                    if hit is None:
+                        raise RuntimeError(f"归档里取不到 {target}")
+                    got = hit
+                with open(got, "rb") as f:
                     data = f.read()
             finally:
                 import shutil
@@ -1711,7 +1947,7 @@ a.pack:hover{background:var(--accent-h)}
         """整季视图里的「一个版本」行。"""
         tag = LANG_LABEL.get(c["lang"], c["lang"] or "?")
         qs = urllib.parse.urlencode({"fp": c["fullpath"], "ip": c["inner_path"]})
-        size = f'{c["size"]:,} B' if (c["size"] or 0) > 0 else "—"
+        size = fmt_size(c["size"])
         name = c["inner_path"].rsplit("/", 1)[-1]
         best = ' best' if c.get("_best") else ''
         star = '★' if c.get("_best") else ''
@@ -1741,7 +1977,7 @@ a.pack:hover{background:var(--accent-h)}
             lvl = int(r["_level"])
             tag = LANG_LABEL.get(r["lang"], r["lang"] or "?")
             qs = urllib.parse.urlencode({"fp": r["fullpath"], "ip": r["inner_path"]})
-            size = f'{r["size"]:,} 字节' if (r["size"] or 0) > 0 else "大小未知"
+            size = fmt_size(r["size"])
             body.append(
                 f'<div class="row"><div class="badge l{lvl}">{tag}</div>'
                 f'<div class="meta"><div class="title">{html.escape(r["cnname"] or "-")}'
@@ -1782,8 +2018,8 @@ a.pack:hover{background:var(--accent-h)}
         zq = urllib.parse.urlencode({"q": series_q, "season": season, "lang": lang})
         body.append(_tabs(series_q, lang, season, "episode", theme))
         body.append(
-            f'<div class="banner"><div><b>《{html.escape(label)}》第 {season} 季 —— '
-            f'{len(pairs)} 集 / {n_ver} 个版本</b>'
+            f'<div class="banner"><div><b>《{html.escape(label)}》{season_title(season)} —— '
+            f'{len(pairs)} {"个特别篇" if season == 0 else "集"} / {n_ver} 个版本</b>'
             f'<small>默认列出每集全部版本，★ 是推荐的那条；合计约 {total_size / 1e6:.1f} MB'
             f'（仅推荐版）</small></div>'
             f'<div class="acts"><a class="pack" href="/season.zip?{zq}">'
@@ -1811,7 +2047,7 @@ a.pack:hover{background:var(--accent-h)}
             rows = "".join(_ver_row(c) for c in shown)
             body.append(
                 f'<div class="epblock"><div class="ephead">'
-                f'<span class="no">S{season:02d}E{ep:02d}</span>'
+                f'<span class="no">{("SP%02d" % ep) if season == 0 else ("S%02dE%02d" % (season, ep))}</span>'
                 f'<span class="cnt">共 {len(cands)} 个版本'
                 + (f'，显示前 1 个' if not show_all and len(cands) > 1 else '')
                 + f' · 推荐：{LANG_LABEL.get(cands[0]["lang"], "?")}'
@@ -1860,10 +2096,11 @@ a.pack:hover{background:var(--accent-h)}
             nf = sum(len(c) for _e, c in pairs)
             sq = urllib.parse.urlencode({"q": g["series_key"] or q, "season": se,
                                          "lang": lang})
+            unit = "个特别篇" if se == 0 else "集"
             body.append(
                 f'<div class="seasrow"><div class="sleft">'
-                f'<span class="sno">第 {se} 季</span>'
-                f'<span class="sinfo">{len(pairs)} 集 · {nf} 个文件 · '
+                f'<span class="sno">{season_title(se)}</span>'
+                f'<span class="sinfo">{len(pairs)} {unit} · {nf} 个文件 · '
                 f'{len(vers)} 个版本</span></div>'
                 f'<div class="sright">'
                 f'<a class="btn primary" href="/?{sq}&view=season">整季下载</a>'
@@ -1890,10 +2127,11 @@ a.pack:hover{background:var(--accent-h)}
 
         body = [_tabs(series_q, lang, season, "season", theme)]
         n_ep = len(group["pairs"])
+        unit = "个特别篇" if season == 0 else "集"
         body.append(f'<div class="head"><h2>《{html.escape(group["label"])}》'
-                    f'<span class="sep">/</span>第 {season} 季</h2>'
-                    f'<div class="sub">共 {n_ep} 集 · 按发布版本整理成 '
-                    f'{len(vers)} 个整季包</div></div>')
+                    f'<span class="sep">/</span>{season_title(season)}</h2>'
+                    f'<div class="sub">共 {n_ep} {unit} · 按发布版本整理成 '
+                    f'{len(vers)} 个包</div></div>')
         body.append('<div class="note">每个整季包里，每集只放一个字幕文件，'
                     '下载后可直接使用。点语言即开始打包下载。</div>')
 
@@ -1907,14 +2145,21 @@ a.pack:hover{background:var(--accent-h)}
             cov = f'{v["coverage"]}/{v["total"]} 集'
             warn = f'<span class="warn">缺 {v["total"] - v["coverage"]} 集</span>' if partial else ''
             btns = []
+            # 语言覆盖不足两个就不给按钮 —— 但整季只有一集时（比如单个特别篇）
+            # 门槛要放宽到 1，否则一个按钮都出不来。
+            floor = min(2, v["total"])
             for lg, d in sorted(v["langs"].items(), key=lambda t: LANG_RANK.get(t[0], 9)):
-                if d["n"] < 2:
+                if d["n"] < floor:
                     continue
                 tag = LANG_LABEL.get(lg, lg or "未标注")
+                d["bytes"] = sum((c["size"] or 0) for c in d["eps"].values()
+                                 if (c["size"] or 0) > 0)
                 zq = urllib.parse.urlencode({"q": series_q, "season": season,
                                              "lang": lg, "family": v["family"]})
                 btns.append(f'<a class="btn small" href="/season.zip?{zq}">'
-                            f'下载 {tag} <span class="n">{d["n"]}</span></a>')
+                            f'下载 {tag} <span class="n">{d["n"]} 集 · '
+                            f'{fmt_size(d["bytes"]) if d["bytes"] else "大小未知"}'
+                            f'</span></a>')
             if not btns:
                 continue
             body.append(
@@ -1948,6 +2193,17 @@ a.pack:hover{background:var(--accent-h)}
                 return default
 
         def do_GET(self):
+            try:
+                self._route()
+            except sqlite3.Error as e:
+                # 典型场景：一边重建索引一边开着服务。SQLite 读到被换掉的页会报
+                # "database disk image is malformed"。别丢一堆栈，给一句人话。
+                self.send_error(503, f"索引暂时不可用（{e}）。"
+                                     "如果刚在重建索引，等它跑完再刷新。")
+            except BrokenPipeError:
+                pass
+
+        def _route(self):
             u = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(u.query)
 
