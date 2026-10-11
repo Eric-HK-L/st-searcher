@@ -45,7 +45,7 @@ case "$ACTION" in
     "$VENV_PY" scripts/daemon.py status
     ;;
   stop)
-    echo "  本地语料检索 —— 一键停止"
+    echo "  本地语料检索 —— 停止服务"
     hr
     "$VENV_PY" scripts/daemon.py stop
     ;;

@@ -95,7 +95,7 @@ if [ -f "$REQ" ]; then
     tail -5 "$LOG_DIR/pip.err" 2>/dev/null | sed 's/^/     /' || true
   fi
 else
-  echo "  ℹ️ 没有 requirements.txt，跳过"
+  echo "  ℹ️ 未发现 requirements.txt，跳过"
 fi
 
 # ---------------------------------------------------------------------------
@@ -124,9 +124,9 @@ set -e
 [ "$STDLIB_RC" = "0" ] || die "标准库检查未通过"
 
 if command -v bsdtar >/dev/null 2>&1; then
-  echo "  ✅ bsdtar: $(command -v bsdtar)   (解 rar/7z 用)"
+  echo "  ✅ bsdtar: $(command -v bsdtar)   (用于解压 rar/7z)"
 else
-  echo "  ⚠️ 没找到 bsdtar —— rar/7z 无法解包，zip 和裸字幕不受影响"
+  echo "  ⚠️ 未找到 bsdtar —— rar/7z 无法解包；zip 与裸字幕不受影响"
   echo "     macOS 自带 /usr/bin/bsdtar；Linux: apt install libarchive-tools"
 fi
 
@@ -177,7 +177,7 @@ fi
 if [ "$DATA_RC" = "2" ]; then
   if [ "$BUILD_INDEX" = "1" ]; then
     echo
-    echo "  ▸ 建索引（首次约 1 分钟）…"
+    echo "  ▸ 构建索引（首次约 1 分钟）…"
     "$VENV_PY" scripts/indexer.py build-meta
     "$VENV_PY" scripts/indexer.py scan-inner --workers 12
     "$VENV_PY" scripts/searcher.py build-subs
@@ -207,7 +207,7 @@ if [ "$RC" = "0" ]; then
 import sys; sys.path.insert(0,'scripts')
 from config import HOST, PORT
 print(f'http://{HOST}:{PORT}/')")"
-  echo "  打开: $URL"
+  echo "  地址: $URL"
   echo "  停止: ./stop.sh          状态: ./run.sh status"
   echo "  日志: $LOG_DIR/server.log"
   if "$VENV_PY" -c "
