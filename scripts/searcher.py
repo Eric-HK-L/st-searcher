@@ -1,0 +1,1512 @@
+#!/usr/bin/env python3
+"""
+归档语料检索器 —— 从「文件名」定位到归档中的对应文件并取出来。
+
+典型用法：
+    # 建一次匹配索引
+    python3 scripts/searcher.py build-subs
+
+    # 看片前：直接对着视频文件找
+    python3 scripts/searcher.py find ~/Movies/The.Vampire.Diaries.S03E10.720p.mkv
+
+    # 不落地，只看看有哪些候选
+    python3 scripts/searcher.py find "权力的游戏 S08E01" --dry-run
+
+    # 整个目录体检 / 批量补齐
+    python3 scripts/searcher.py scan ~/Movies --apply
+
+    # 起一个本地网页，随时搜随时下
+    python3 scripts/searcher.py serve
+
+匹配三级回退：
+    L1 发布组名完全一致  release_key 相同          （同一压制版本，最准）
+    L2 剧名 token + 季集  series 匹配 + SxxExx     （不同压制版本也能中）
+    L3 片名 token 模糊    title token 重叠打分      （电影、改名文件）
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import io
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from config import (  # noqa: E402
+    AUTO_OPEN_BROWSER,
+    CORPUS_DIR,
+    DB_PATH,
+    HOST,
+    INDEX_DIR,
+    PORT,
+    PROJECT_DIR,
+    corpus_ready,
+    missing_corpus_files,
+)
+from indexer import _list_inner, open_archives  # noqa: E402
+
+try:  # 可选依赖：装了就更准，没装也能跑
+    from charset_normalizer import from_bytes as _cn_from_bytes
+except ImportError:
+    _cn_from_bytes = None
+
+VIDEO_EXT = {
+    ".mkv", ".mp4", ".avi", ".rmvb", ".rm", ".wmv", ".mov", ".m4v", ".ts",
+    ".m2ts", ".flv", ".mpg", ".mpeg", ".vob", ".iso", ".webm", ".divx", ".ogm",
+}
+SUB_EXT = {".srt", ".ass", ".ssa", ".sub", ".idx", ".sup"}
+
+# ---------------------------------------------------------------------------
+# 文件名归一化
+# ---------------------------------------------------------------------------
+
+# 语言后缀（出现在字幕文件名末尾）
+_LANG_TOKEN = (
+    r"(?:简体|繁体|简中|繁中|简英|繁英|中英|双语|中文|英文|英语|日文|日语|韩语|"
+    r"中文字幕|英文字幕|chs|cht|chi|eng|jpn|kor|sc|tc|gb|big5|hans|hant|zhcn|zhtw|"
+    r"zh|cn|en)"
+)
+_LANG_SUFFIX_RE = re.compile(
+    r"[.\s_\-\[]*"
+    r"(?:"
+    + _LANG_TOKEN + r"\s*[&＆+]\s*" + _LANG_TOKEN +
+    r"|" + _LANG_TOKEN +
+    r")"
+    r"[\]\s]*$",
+    re.I,
+)
+
+# 发布组名里的噪声词（保留年份以外的数字，避免把 Iron.Man.3 削成 Iron.Man）
+_NOISE = {
+    "720p", "1080p", "2160p", "480p", "4k", "uhd", "hd", "sd", "fullhd",
+    "hdrip", "brrip", "bdrip", "bluray", "blu", "ray", "bd", "webrip", "web",
+    "webdl", "hdtv", "dvdrip", "dvd", "dvdr", "hdts", "ts", "tc", "cam",
+    "x264", "x265", "h264", "h265", "hevc", "avc", "xvid", "divx", "av1",
+    "aac", "ac3", "eac3", "dts", "dtshd", "truehd", "flac", "mp3", "ddp",
+    "ddp5", "dd5", "dd", "atmos", "5", "1", "7", "2", "0",
+    "remux", "proper", "repack", "internal", "limited", "extended", "unrated",
+    "complete", "season", "multi", "subs", "subbed", "dubbed", "hdr", "hdr10",
+    "dolby", "vision", "dv", "10bit", "8bit", "amzn", "nf", "hmax", "dsnp",
+    "atvp", "itunes", "ita", "vostfr", "ita", "eng", "chi", "chs", "cht",
+    "gb", "big5", "mkv", "mp4", "avi", "rmvb",
+}
+
+_YEAR_RE = re.compile(r"(?:^|[.\s_\[(])((?:19|20)\d{2})(?:[.\s_\])]|$)")
+_EP_RE = re.compile(
+    r"(?:^|[.\s_\[(])"
+    r"(?:s\s*(\d{1,2})\s*[.\s_-]*e\s*(\d{1,3})|(\d{1,2})\s*x\s*(\d{2,3})|"
+    r"第\s*(\d{1,3})\s*季[.\s_-]*第\s*(\d{1,3})\s*[集话話])"
+    r"(?:[.\s_\])-]|$)",
+    re.I,
+)
+_CN_EP_RE = re.compile(r"第\s*([0-9一二三四五六七八九十百]{1,4})\s*季")
+_CN_EP2_RE = re.compile(r"第\s*([0-9一二三四五六七八九十百]{1,4})\s*[集话話]")
+# 只有季、没有集：S08 / Season 8 / S8
+_SEASON_ONLY_RE = re.compile(
+    r"(?:^|[.\s_\[(])(?:s|season[.\s_-]*)(\d{1,2})(?:[.\s_\])-]|$)",
+    re.I,
+)
+
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+           "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12, "十三": 13,
+           "十四": 14, "十五": 15, "十六": 16, "十七": 17, "十八": 18,
+           "十九": 19, "二十": 20}
+
+# 这些词区分度太低，不能单独作为匹配依据
+STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "at", "for", "with",
+    "by", "from", "is", "are", "was", "were", "be", "it", "its", "my", "me",
+    "you", "your", "i", "we", "us", "he", "she", "they", "them", "his", "her",
+    "this", "that", "these", "those", "as", "but", "not", "no", "all", "so",
+    "do", "did", "does", "have", "has", "had", "will", "would", "can", "could",
+    "part", "pt", "vol", "chapter", "ep", "episode", "season", "series",
+    "movie", "film", "full", "new", "old", "great", "big", "little", "last",
+    "first", "one", "two", "three", "ii", "iii", "iv",
+}
+_EP_TOKEN_RE = re.compile(r"^(?:s\d{1,2}e\d{1,3}|\d{1,2}x\d{2,3}|s\d{1,2}|e\d{1,3})$", re.I)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+
+
+def cn2int(s):
+    if s.isdigit():
+        return int(s)
+    if s in _CN_NUM:
+        return _CN_NUM[s]
+    m = re.fullmatch(r"([一二三四五六七八九])?十([一二三四五六七八九])?", s)
+    if m:
+        return (int(_CN_NUM.get(m.group(1), 1)) * 10) + int(_CN_NUM.get(m.group(2), 0))
+    return None
+
+
+def fix_cp437(name: str) -> str:
+    """zip 里未标 UTF-8 的中文名会被解成 CP437 乱码，还原回 GBK。"""
+    if not name or name.isascii():
+        return name
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return name
+    try:
+        return raw.decode("gb18030")
+    except UnicodeDecodeError:
+        return name
+
+
+def norm_key(s: str) -> str:
+    """归一化成点分小写 key：只保留字母数字和汉字。"""
+    s = unicodedata.normalize("NFKC", s).lower()
+    out = []
+    for ch in s:
+        if ch.isalnum() or "\u4e00" <= ch <= "\u9fff":
+            out.append(ch)
+        else:
+            out.append(".")
+    return re.sub(r"\.+", ".", "".join(out)).strip(".")
+
+
+def split_lang(stem: str):
+    """剥掉末尾的语言标记，返回 (主干, 语言标签)。"""
+    langs = []
+    cur = stem
+    for _ in range(3):
+        m = _LANG_SUFFIX_RE.search(cur)
+        if not m:
+            break
+        langs.append(m.group(0).strip(" ._-[]"))
+        cur = cur[: m.start()]
+    if not cur:
+        cur = stem
+        langs = []
+    tag = classify_lang(langs)
+    return cur, tag
+
+
+def classify_lang(marks):
+    txt = " ".join(marks).lower()
+    has_chs = bool(re.search(r"简体|简中|简英|chs|\bsc\b|\bgb\b|中文|中英|双语", txt))
+    has_cht = bool(re.search(r"繁体|繁中|繁英|cht|\btc\b|big5", txt))
+    has_eng = bool(re.search(r"英文|英语|eng", txt))
+    if "中英" in txt or "双语" in txt:
+        return "chs_eng"
+    if has_chs and has_eng:
+        return "chs_eng"
+    if has_cht and has_eng:
+        return "cht_eng"
+    if has_chs:
+        return "chs"
+    if has_cht:
+        return "cht"
+    if has_eng:
+        return "eng"
+    if re.search(r"日文|日语|jpn", txt):
+        return "jpn"
+    return ""
+
+
+def parse_episode(text: str):
+    m = _EP_RE.search(text)
+    if m:
+        if m.group(1):
+            return int(m.group(1)), int(m.group(2))
+        if m.group(3):
+            return int(m.group(3)), int(m.group(4))
+        if m.group(5):
+            return cn2int(m.group(5)), cn2int(m.group(6))
+    return None, None
+
+
+def parse_video_name(name: str):
+    """视频文件名 -> 结构化信息。支持整季（只有季没有集）。"""
+    stem = Path(name).stem
+    base, lang = split_lang(stem)
+    season, episode = parse_episode(stem)
+    if season is None:
+        m = _CN_EP_RE.search(stem)
+        season = cn2int(m.group(1)) if m else None
+        m2 = _CN_EP2_RE.search(stem)
+        episode = cn2int(m2.group(1)) if m2 else None
+    if season is None:
+        m = _SEASON_ONLY_RE.search(stem)
+        if m:
+            season = int(m.group(1))
+            episode = None
+
+    # 剧名部分：SxxExx / Sxx 之前；电影则整段
+    head = base
+    m = _EP_RE.search(base)
+    if m:
+        head = base[: m.start()]
+    else:
+        sm = _SEASON_ONLY_RE.search(base)
+        if sm:
+            head = base[: sm.start()]
+    if season is not None:
+        head = _CN_EP_RE.sub(" ", head)
+        head = _CN_EP2_RE.sub(" ", head)
+
+    release_key = norm_key(base)
+    series_key = norm_key(head)
+    cjk = [p for p in _CJK_RE.findall(head)
+           if len(p) >= 2 and not _is_generic_cjk(p)]
+
+    year = None
+    m = _YEAR_RE.search(stem)
+    if m:
+        year = int(m.group(1))
+
+    # 去掉末尾发布组 -GROUP
+    clean = re.sub(r"[-\s](?:19|20)\d{2}.*$", "", head)
+    group = None
+    gm = re.search(r"-([A-Za-z0-9]{2,20})$", clean)
+    if gm:
+        group = gm.group(1).lower()
+
+    title_toks = []
+    for t in norm_key(head).split("."):
+        if not t or _EP_TOKEN_RE.match(t) or t in _NOISE or t in STOPWORDS:
+            continue
+        if re.fullmatch(r"(?:19|20)\d{2}", t):
+            continue
+        if group and t == group:
+            continue
+        title_toks.append(t)
+
+    return {
+        "stem": stem,
+        "release_key": release_key,
+        "series_key": series_key,
+        "title_key": ".".join(title_toks),
+        "title_toks": title_toks,
+        "cjk": cjk,
+        "season": season,
+        "episode": episode,
+        "season_only": season is not None and episode is None,
+        "year": year,
+        "lang_hint": lang,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 索引构建
+# ---------------------------------------------------------------------------
+SUBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS subs (
+    id          INTEGER PRIMARY KEY,
+    fullpath    TEXT NOT NULL,
+    inner_path  TEXT NOT NULL,
+    ext         TEXT,
+    size        INTEGER,
+    release_key TEXT,
+    series_key  TEXT,
+    title_key   TEXT,
+    season      INTEGER,
+    episode     INTEGER,
+    lang        TEXT,
+    is_bare     INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_subs_ep    ON subs(season, episode);
+CREATE INDEX IF NOT EXISTS ix_subs_skey  ON subs(series_key);
+CREATE INDEX IF NOT EXISTS ix_subs_tkey  ON subs(title_key);
+CREATE INDEX IF NOT EXISTS ix_subs_rkey  ON subs(release_key);
+"""
+
+
+def build_subs(db_path=DB_PATH, verbose=True):
+    """把 inner_files 与单文件归档整理成统一的匹配表。"""
+    con = sqlite3.connect(db_path)
+    con.executescript("DROP TABLE IF EXISTS subs;" + SUBS_SCHEMA)
+    cur = con.cursor()
+
+    buf = []
+    n = 0
+
+    def emit(fullpath, inner_path, ext, size, is_bare):
+        nonlocal n
+        searchable = fix_cp437(inner_path)          # 必须先还原乱码，再解析
+        name = Path(searchable).name
+        stem = os.path.splitext(name)[0]
+        base, lang = split_lang(stem)
+        season, episode = parse_episode(stem)
+
+        head = base
+        m = _EP_RE.search(base)
+        if m:
+            head = base[: m.start()]
+
+        rel = norm_key(base)
+        skey = norm_key(head)
+        toks = [t for t in skey.split(".")
+                if t and not _EP_TOKEN_RE.match(t) and t not in _NOISE
+                and t not in STOPWORDS
+                and not re.fullmatch(r"(?:19|20)\d{2}", t)]
+        buf.append((fullpath, searchable, ext, size, rel, skey, ".".join(toks),
+                    season, episode, lang, is_bare))
+        n += 1
+        if len(buf) >= 20000:
+            cur.executemany(
+                "INSERT INTO subs (fullpath,inner_path,ext,size,release_key,"
+                "series_key,title_key,season,episode,lang,is_bare) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", buf)
+            buf.clear()
+
+    for fullpath, inner_path, ext, size in con.execute(
+        "SELECT fullpath, inner_path, ext, size FROM inner_files "
+        "WHERE ext IN ('srt','ass','ssa','sub')"
+    ):
+        emit(fullpath, inner_path, ext, size, 0)
+    if verbose:
+        print(f"  归档内文件 {n}")
+
+    n0 = n
+    for fullpath, ext, size in con.execute(
+        "SELECT fullpath, kind, size FROM archives WHERE kind IN ('srt','ass','ssa')"
+    ):
+        emit(fullpath, os.path.basename(fullpath), ext, size, 1)
+    if verbose:
+        print(f"  单文件归档 {n-n0}")
+    if buf:
+        cur.executemany(
+            "INSERT INTO subs (fullpath,inner_path,ext,size,release_key,"
+            "series_key,title_key,season,episode,lang,is_bare) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", buf)
+    con.commit()
+
+    # 中文名不复制到 subs：archives.fullpath 是主键，查询时 JOIN 即可，
+    # 省掉 ~120MB 冗余。这里只补一个大小写不敏感的中文检索辅助索引。
+    con.execute("CREATE INDEX IF NOT EXISTS ix_arch_cnname ON archives(cnname)")
+
+    # token 文档频率，用于 IDF 加权（区分 earth 和 wandering）
+    con.executescript("DROP TABLE IF EXISTS token_df;")
+    con.execute("CREATE TABLE token_df (token TEXT PRIMARY KEY, df INTEGER)")
+    df = Counter()
+    for (tk,) in con.execute("SELECT title_key FROM subs WHERE title_key <> ''"):
+        for t in set(tk.split(".")):
+            df[t] += 1
+    con.executemany("INSERT INTO token_df VALUES (?,?)", df.items())
+    con.commit()
+
+    con.commit()
+    con.execute("VACUUM")          # 回收建表过程中产生的空洞，能省 ~15%
+
+    tot = con.execute("SELECT count(*) FROM subs").fetchone()[0]
+    withep = con.execute("SELECT count(*) FROM subs WHERE season IS NOT NULL").fetchone()[0]
+    if verbose:
+        print(f"[build-subs] subs={tot}  带季集={withep} ({withep/tot*100:.1f}%)  "
+              f"词表={len(df):,}")
+    con.close()
+    return tot
+
+
+# ---------------------------------------------------------------------------
+# 匹配
+# ---------------------------------------------------------------------------
+LANG_LABEL = {"chs": "简体", "cht": "繁体", "chs_eng": "简英", "cht_eng": "繁英",
+              "eng": "英文", "jpn": "日文", "": "未知"}
+
+# 用户偏好排序（默认：双语简英 > 简体 > 繁英 > 繁体 > 英文）
+LANG_RANK = {"chs_eng": 0, "chs": 1, "cht_eng": 2, "cht": 3, "eng": 4, "jpn": 6, "": 5}
+EXT_RANK = {"ass": 0, "srt": 1, "ssa": 2, "sub": 3}
+
+
+def _tokens(s):
+    return set(t for t in (s or "").split(".") if t)
+
+
+class IDF:
+    """token -> 逆文档频率。区分 earth（烂大街）和 wandering（稀有）。"""
+
+    def __init__(self, con):
+        self.con = con
+        self.total = con.execute("SELECT count(*) FROM subs").fetchone()[0] or 1
+        self.cache = {}
+
+    def df(self, tok):
+        if tok not in self.cache:
+            r = self.con.execute("SELECT df FROM token_df WHERE token=?", (tok,)).fetchone()
+            self.cache[tok] = r[0] if r else 0
+        return self.cache[tok]
+
+    def has(self, tok):
+        """只认索引里真实存在的词。x264/1080p 这类不在词表里的词不能用来检索。"""
+        return self.df(tok) > 0
+
+    def __call__(self, tok):
+        import math
+        df = self.df(tok)
+        if df <= 0:
+            return 0.0
+        return math.log(1 + self.total / (1 + df))
+
+
+def _is_generic_cjk(phrase):
+    """「第一季」「第3集」这类词区分度为零，不能用来匹配。"""
+    return bool(re.fullmatch(r"第?[0-9一二三四五六七八九十百]+[季集话話部]", phrase))
+
+
+def score_candidate(video, cand, idf=None, ignore_episode=False):
+    """返回 (分数, 说明, 等级) 或 None。等级 3=发布名一致 2=剧名+季集 1=片名相似
+
+    ignore_episode=True 时只要求季一致（用于整季检索）。
+    """
+    v_release = video["release_key"]
+    v_series = _tokens(video["series_key"])
+    v_title = _tokens(video["title_key"])
+    c_release = cand["release_key"] or ""
+    c_series = _tokens(cand["series_key"])
+    c_title = _tokens(cand["title_key"])
+
+    level = 0
+    why = []
+
+    # L3→ 发布组名完全一致（最强）。整季模式下发布名不可能完全一致，跳过。
+    if not ignore_episode:
+        if v_release and v_release == c_release:
+            level = 3
+            why.append("发布名完全一致")
+        elif v_release and len(v_release) > 12 and c_release.startswith(v_release + "."):
+            level = 3
+            why.append("发布名前缀一致")
+
+    # 中文片名命中（用户输入中文，或文件名含中文）
+    if level < 2 and video.get("cjk"):
+        cn = cand.get("cnname") or ""
+        for phrase in video["cjk"]:
+            if len(phrase) >= 2 and phrase in cn:
+                level = max(level, 2)
+                why.append(f"中文片名匹配「{phrase}」")
+                break
+
+    # L2 剧名 + 季（+集）
+    if level < 2 and cand["season"] is not None:
+        season_ok = cand["season"] == video["season"]
+        if ignore_episode:
+            ep_ok = True
+        else:
+            ep_ok = cand["episode"] == video["episode"]
+        if video["season"] is not None and season_ok and ep_ok:
+            s_tok = v_series or v_title
+            if s_tok and c_series:
+                if _series_match_score(s_tok, c_series, idf) >= 0.75:
+                    level = max(level, 2)
+                    tail = (f"S{video['season']:02d}" if ignore_episode
+                            else f"S{video['season']:02d}E{(video['episode'] or 0):02d}")
+                    why.append(f"剧名+{tail}")
+
+    # L1 片名相似（IDF 加权，稀有词为主）
+    if level < 1:
+        base = v_title or v_series
+        if base and (c_title or c_series):
+            pool = c_title | c_series
+            inter = base & pool
+            ratio = _idf_ratio(inter, base, idf)
+            # 至少要有一个非停用词命中，防止 earth/the 这类泛词蒙中
+            if ratio >= 0.65 and inter:
+                level = 1
+                why.append(f"片名匹配 {len(inter)} 词 (IDF {ratio:.0%})")
+
+    if level == 0:
+        return None
+
+    # 季/集不一致就作废
+    if video["season"] is not None and cand["season"] is not None:
+        same_season = video["season"] == cand["season"]
+        same_ep = (not ignore_episode) and video["episode"] == cand["episode"]
+        if ignore_episode:
+            ok = same_season
+        else:
+            ok = same_season and same_ep
+        if not ok:
+            if level >= 2:
+                return None
+            level = 0.5
+            why.append("季集不一致")
+
+    score = level * 1000
+    score -= LANG_RANK.get(cand["lang"], 5) * 8
+    score -= EXT_RANK.get(cand["ext"], 4) * 2
+    # 电影：年份对上更可信（黑客帝国 1999 vs 动画版 2003）
+    if video.get("year") and str(video["year"]) in (cand["release_key"] or ""):
+        score += 30
+    elif video.get("year"):
+        score -= 20
+    if cand["size"] and cand["size"] > 0:
+        score += min(cand["size"] / 200000, 5)
+    return (score, " / ".join(why), level)
+
+
+_YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _idf_ratio(inter, base, idf):
+    """交集占查询方的比重（IDF 加权）。用于「查询的词被命中多少」。"""
+    if not base:
+        return 0.0
+    if idf is None:
+        return len(inter) / len(base)
+    num = sum(idf(t) for t in inter)
+    den = sum(idf(t) for t in base)
+    if den <= 0:
+        # 整串都是停用词（"this is us" / "you" / "it"）时 IDF 全为 0，
+        # 分子分母同时归零 —— 退回按词数算，否则这类剧永远搜不到。
+        return len(inter) / len(base)
+    return num / den
+
+
+def _series_match_score(s_tok, c_tok, idf):
+    """对称的剧名匹配度 = 交集 / 并集（先去掉年份 token）。
+
+    用并集而不是查询方，是为了挡住「CSI 匹配到 CSI: Miami」这类：
+    候选比查询多出实义词时，说明它其实是另一部剧，不该算精确匹配。
+    年份属于噪声（This.Is.Us vs This.Is.Us.2016），比对前先剔除。
+    """
+    s = {t for t in s_tok if not _YEAR_TOKEN_RE.fullmatch(t)}
+    c = {t for t in c_tok if not _YEAR_TOKEN_RE.fullmatch(t)}
+    if not s or not c:
+        return 0.0
+    inter = s & c
+    if not inter:
+        return 0.0
+    union = s | c
+    if idf is None:
+        return len(inter) / len(union)
+    num = sum(idf(t) for t in inter)
+    den = sum(idf(t) for t in union)
+    if den <= 0:
+        return len(inter) / len(union)
+    return num / den
+
+
+class CandidateList(list):
+    """带元信息的候选列表：truncated=True 表示某条 SQL 撞到了行数上限，
+    可能漏掉了结果（整季检索尤其容易被截断）。"""
+
+    def __init__(self, *a, truncated=False, **kw):
+        super().__init__(*a, **kw)
+        self.truncated = truncated
+
+
+def find_candidates(con, video, limit=200, lang_pref=None, ignore_episode=False,
+                    sql_cap=None):
+    """先用 SQL 收窄，再在 Python 里精排。
+
+    ignore_episode=True -> 只要同一季的都算候选（整季检索用）。
+
+    limit 是「每个子查询取多少行」的上限，不是最终结果条数。
+    整季检索一定要给足 sql_cap —— 一季 22 集 × 每集 20 个文件就是 440 行，
+    给 400 会正好把最后一集切掉（这个 bug 真实发生过）。
+    """
+    if sql_cap is None:
+        # 整季模式按「集数 × 每集文件数」留足余量
+        sql_cap = max(20000 if ignore_episode else 5000,
+                      limit * (50 if ignore_episode else 25))
+
+    rows = []
+    v = video
+    idf = IDF(con)
+    seen_row = set()
+    truncated = [False]
+
+    def q(sql, args):
+        got = 0
+        cur = con.execute(sql, args)
+        cols = [d[0] for d in cur.description]
+        for tup in cur:
+            got += 1
+            # 不依赖调用方设置 row_factory=sqlite3.Row，元组和 Row 都能处理
+            r = dict(zip(cols, tup)) if not isinstance(tup, sqlite3.Row) else dict(tup)
+            k = (r["fullpath"], r["inner_path"])
+            if k in seen_row:
+                continue
+            seen_row.add(k)
+            rows.append(r)
+        cap = args[-1] if args and isinstance(args[-1], int) else None
+        if cap is not None and got >= cap:
+            truncated[0] = True
+
+    base = ("SELECT s.*, a.cnname, a.enname, a.year AS archive_year "
+            "FROM subs s LEFT JOIN archives a ON a.fullpath = s.fullpath ")
+
+    # 1) 发布名精确 / 前缀（整季模式下跳过，发布名必然带集号）
+    if v["release_key"] and not ignore_episode:
+        q(base + "WHERE s.release_key = ? LIMIT ?", (v["release_key"], sql_cap))
+        q(base + "WHERE s.release_key LIKE ? LIMIT ?", (v["release_key"] + ".%", sql_cap))
+
+    if v["season"] is None:
+        ep_sql, ep_args = "", ()
+    elif ignore_episode:
+        ep_sql, ep_args = " AND s.season = ?", (v["season"],)
+    else:
+        ep_sql, ep_args = " AND s.season = ? AND s.episode = ?", (v["season"], v["episode"])
+
+    # 2) 剧名 key 精确（+季集）
+    if v["series_key"]:
+        q(base + "WHERE s.series_key = ?" + ep_sql + " LIMIT ?",
+          (v["series_key"],) + ep_args + (sql_cap,))
+        q(base + "WHERE s.series_key LIKE ?" + ep_sql + " LIMIT ?",
+          (v["series_key"] + ".%",) + ep_args + (sql_cap,))
+    if v["title_key"]:
+        q(base + "WHERE s.title_key = ?" + ep_sql + " LIMIT ?",
+          (v["title_key"],) + ep_args + (sql_cap,))
+
+    # 3) 中文片名（用户输入中文，或中文文件名的影视）
+    if v.get("cjk"):
+        for phrase in v["cjk"][:2]:
+            if len(phrase) < 2:
+                continue
+            q(base + "WHERE a.cnname LIKE ?" + ep_sql + " LIMIT ?",
+              (f"%{phrase}%",) + ep_args + (sql_cap,))
+            q(base + "WHERE s.inner_path LIKE ?" + ep_sql + " LIMIT ?",
+              (f"%{phrase}%",) + ep_args + (sql_cap,))
+
+    # 4) 季集兜底（靠 Python 打分筛剧名）。这一档跨所有剧，上限单独给。
+    if len(rows) < 20 and v["season"] is not None:
+        if ignore_episode:
+            q(base + "WHERE s.season = ? LIMIT ?", (v["season"], 30000))
+        else:
+            q(base + "WHERE s.season = ? AND s.episode = ? LIMIT ?",
+              (v["season"], v["episode"], 8000))
+
+    # 5) 片名 token 模糊（只用语料库里真实存在的词，稀有词优先）
+    if len(rows) < 20:
+        pool = [t for t in (v["title_toks"] or []) if idf.has(t)]
+        if not pool:
+            pool = [t for t in _tokens(v["series_key"]) if idf.has(t)]
+        pool.sort(key=lambda t: -idf(t))
+        for t in pool[:3]:
+            if len(t) < 3:
+                continue
+            q(base + "WHERE s.title_key LIKE ?" + ep_sql + " LIMIT ?",
+              (f"%{t}%",) + ep_args + (sql_cap,))
+            if len(rows) >= 20:
+                break
+
+    seen = {}
+    for r in rows:
+        r["cnname"] = fix_cp437(r["cnname"]) if r.get("cnname") else r.get("cnname")
+        r["enname"] = fix_cp437(r["enname"]) if r.get("enname") else r.get("enname")
+        sc = score_candidate(v, r, idf, ignore_episode=ignore_episode)
+        if not sc:
+            continue
+        r["_score"], r["_why"], r["_level"] = sc
+        # 同一份字幕可能存在于多个归档，按内容指纹去重
+        fp = (r["inner_path"].rsplit("/", 1)[-1].lower(), r["size"])
+        prev = seen.get(fp)
+        if prev is None or r["_score"] > prev["_score"]:
+            seen[fp] = r
+    out = CandidateList(seen.values(), truncated=truncated[0])
+    out.sort(key=lambda r: (-r["_score"], r["inner_path"]))
+    if lang_pref:
+        want = set(lang_pref)
+        filtered = [r for r in out if r["lang"] in want]
+        if filtered:
+            out = CandidateList(filtered, truncated=truncated[0])
+    return out
+
+
+def _group_label(pairs, fallback):
+    """给一个剧集分组取个可读名字：优先中文名，其次英文名，最后 series_key。"""
+    for _ep, cands in pairs:
+        for c in cands:
+            if c.get("cnname"):
+                return c["cnname"]
+    for _ep, cands in pairs:
+        for c in cands:
+            if c.get("enname"):
+                return c["enname"]
+    return fallback.replace(".", " ")
+
+
+def season_groups(con, video, season=None, lang_pref=None):
+    """整季检索，返回按剧集分组的列表（主组在第一个）。
+
+    [{"series_key", "label", "pairs": [(ep, [候选...]), ...], "primary": bool}, ...]
+
+    为什么要分组：像 "spartacus" 这种查询，既可能指《Spartacus》，
+    也可能指《Spartacus: Blood and Sand》；"project.runway" 同理，
+    还可能是衍生剧《Project Runway All Stars》。这两种情况在文件名字面上
+    完全无法区分，所以不猜 —— 把主组列出来，其余分组一并展示让用户挑。
+    """
+    v = dict(video)
+    v["season"] = season if season is not None else video.get("season")
+    v["episode"] = None
+    if v["season"] is None:
+        return []
+    cands = find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True,
+                            sql_cap=60000)
+    if getattr(cands, "truncated", False):
+        print(f"⚠️  第 {v['season']} 季的候选行数触到了数据库上限，可能有遗漏。",
+              file=sys.stderr)
+
+    # 按 series_key 分桶 —— 这一条本身就保证了「不同剧不会混在同一张列表里」，
+    # 所以不要再按匹配等级过滤：那会把《Spartacus: Blood and Sand》这类
+    # 需要靠 L1 才够得着的分组直接丢掉，用户就再也看不到它了。
+    buckets = {}
+    for c in cands:
+        if c["episode"] is None:
+            continue
+        buckets.setdefault(c["series_key"] or "", {}).setdefault(
+            c["episode"], []).append(c)
+
+    groups = []
+    for sk, by_ep in buckets.items():
+        pairs = sorted(by_ep.items())
+        groups.append({"series_key": sk, "label": _group_label(pairs, sk),
+                       "pairs": pairs, "primary": False})
+    if not groups:
+        return []
+    groups.sort(key=lambda g: -len(g["pairs"]))
+
+    # 主组规则：查询词正好等于某个 series_key 就用它，否则用集数最多的那个。
+    # 「用户打的字就是这部剧的名字」是最不意外的一条规则。
+    exact = [g for g in groups if g["series_key"] == (v.get("series_key") or "")]
+    primary = exact[0] if exact else groups[0]
+    order = [primary] + [g for g in groups if g is not primary]
+    order[0]["primary"] = True
+    return order
+
+
+def find_season(con, video, season=None, lang_pref=None):
+    """整季检索：返回主分组的 [(episode, [候选...]), ...]，按集号排序。"""
+    groups = season_groups(con, video, season, lang_pref)
+    return groups[0]["pairs"] if groups else []
+
+
+# ---------------------------------------------------------------------------
+# 落地：写出播放器能自动识别的字幕
+# ---------------------------------------------------------------------------
+PLAYER_LANG = {"chs": "zh", "cht": "zh-Hant", "chs_eng": "zh", "cht_eng": "zh-Hant",
+               "eng": "en", "jpn": "ja", "": "zh"}
+
+
+def subtitle_target_path(video_path: Path, cand, mode="sidecar"):
+    """生成字幕目标路径。默认与视频同目录同名前缀，播放器自动加载。"""
+    ext = "." + (cand["ext"] or "srt")
+    lang = PLAYER_LANG.get(cand["lang"], "zh")
+    if mode == "sidecar":
+        return video_path.with_name(video_path.stem + f".{lang}" + ext)
+    return video_path.parent / (video_path.stem + f".{lang}" + ext)
+
+
+def materialize(con, cand, dest: Path):
+    """把某个候选字幕从归档里解出来写到 dest。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fullpath = cand["fullpath"]
+    inner = cand["inner_path"]
+    coll = fullpath.split("/")[0]
+    zmap = dict(open_archives(coll))
+    z = zmap.get(coll)
+    if z is None:
+        raise RuntimeError(f"打不开归档容器 {coll}")
+    blob = z.read(fullpath)
+    if cand["is_bare"] or inner == os.path.basename(fullpath):
+        data = blob
+    else:
+        ext = os.path.splitext(fullpath)[1].lower()
+        target = None
+        rows = _list_inner(fullpath, blob)
+        if rows:
+            # 找到匹配的内层成员
+            for nm, _sz in rows:
+                if fix_cp437(nm) == inner or nm == inner:
+                    target = nm
+                    break
+        if target is None:
+            target = inner
+        if ext == ".zip":
+            import zipfile
+            iz = zipfile.ZipFile(io.BytesIO(blob))
+            data = iz.read(target)
+        else:
+            tmpd = tempfile.mkdtemp()
+            try:
+                tmp = os.path.join(tmpd, "a" + ext)
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                subprocess.run(["bsdtar", "-xf", tmp, "-C", tmpd, target],
+                               check=True, timeout=300)
+                with open(os.path.join(tmpd, target), "rb") as f:
+                    data = f.read()
+            finally:
+                import shutil
+                shutil.rmtree(tmpd, ignore_errors=True)
+    with open(dest, "wb") as f:
+        f.write(data)
+    return len(data), data
+
+
+def _score_text(t):
+    """给一个解码结果打分：汉字多=好，半角片假名/生僻区/控制符=坏。
+
+    关键场景：GBK 的「为什么」被当成 cp932 解出来会是半角片假名「ﾗﾖﾄｻ」，
+    这类结果必须被压下去，否则字幕会变成乱码。
+    """
+    if not t:
+        return -99.0
+    n = len(t)
+    cjk = kana = halfwidth = astral = ctrl = bad = 0
+    for ch in t:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF:
+            cjk += 1
+        elif 0x3040 <= o <= 0x30FF:
+            kana += 1
+        elif 0xFF61 <= o <= 0xFF9F:
+            halfwidth += 1
+        elif o > 0xFFFF:
+            astral += 1
+        elif o < 32 and ch not in "\r\n\t":
+            ctrl += 1
+        elif ch == "\ufffd":
+            bad += 1
+    plain = n - cjk - kana - halfwidth - astral - ctrl - bad
+    return (cjk * 2.0 + plain * 0.2 - halfwidth * 4.0 - astral * 2.0
+            - ctrl * 3.0 - bad * 8.0) / n
+
+
+# UTF-8 误判的典型症状：解出来全是希腊/西里尔/拉丁补充/IPA 字母。
+# 例："为什么" 的 GBK 字节 CE AA CA B2 C3 B4 恰好是合法的 UTF-8，
+#     会被解成 "Ϊʲô" —— 单看「UTF-8 能解开」是发现不了的。
+_SUSPECT_RANGES = ((0x00A0, 0x00FF), (0x0250, 0x02FF),
+                   (0x0370, 0x03FF), (0x0400, 0x04FF))
+
+
+def _looks_like_mojibake(t: str) -> bool:
+    """UTF-8 解出来既没有汉字也没有其它非拉丁文字，只有希腊/西里尔字母 —— 可疑。"""
+    if not t:
+        return False
+    cjk = other = susp = ascii_ = 0
+    for ch in t:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF:
+            cjk += 1
+        elif o < 128:
+            ascii_ += 1
+        elif any(a <= o <= b for a, b in _SUSPECT_RANGES):
+            susp += 1
+        else:
+            other += 1
+    if cjk or other:
+        return False
+    return susp > 0 and susp >= (susp + ascii_) * 0.05
+
+
+def decode_subtitle(data: bytes):
+    """把字幕字节解成文本，返回 (text, encoding)。
+
+    有 BOM 就直接信；否则：
+      · 严格 UTF-8 能解开，且结果不像乱码  -> 就用 UTF-8
+      · 否则在候选编码里挑打分最高的
+    charset-normalizer 装了就用（多一个候选），没装也能正常工作。
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16"), "utf-16"
+        except UnicodeDecodeError:
+            pass
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", "replace"), "utf-8-sig"
+
+    cands = {}
+    try:
+        t8 = data.decode("utf-8")
+        if not _looks_like_mojibake(t8):
+            return t8, "utf-8"
+        cands["utf-8"] = t8            # 可疑，交给打分一起比
+    except UnicodeDecodeError:
+        pass
+    for enc in ("gb18030", "big5hkscs", "cp932"):
+        try:
+            cands[enc] = data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    if _cn_from_bytes is not None:
+        try:
+            best = _cn_from_bytes(data).best()
+            if best is not None and best.encoding:
+                cands.setdefault(str(best.encoding), str(best))
+        except Exception:
+            pass
+    if not cands:
+        return data.decode("latin-1", "replace"), "latin-1"
+    enc, txt = max(cands.items(), key=lambda kv: _score_text(kv[1]))
+    return txt, enc
+
+
+def normalize_text_bytes(data: bytes):
+    """把字幕转成 UTF-8；返回 (bytes, encoding)。确实是 UTF-8 就原样返回。"""
+    if data[:2] not in (b"\xff\xfe", b"\xfe\xff") and not data.startswith(b"\xef\xbb\xbf"):
+        try:
+            t8 = data.decode("utf-8")
+            if not _looks_like_mojibake(t8):
+                return data, "utf-8"
+        except UnicodeDecodeError:
+            pass
+    text, enc = decode_subtitle(data)
+    return text.encode("utf-8"), enc
+
+
+# ---------------------------------------------------------------------------
+# 整季
+# ---------------------------------------------------------------------------
+def parse_episode_filter(spec, available):
+    """'1-5,8,10' -> {1,2,3,4,5,8,10}；spec 为空则全要。"""
+    if not spec:
+        return set(available)
+    want = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if m:
+            want.update(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.isdigit():
+            want.add(int(part))
+    return want & set(available) if want else set(available)
+
+
+def season_pick(con, video, season, lang_pref=None, episodes=None):
+    """返回 [(episode, best_candidate), ...]，每集只取最佳一条。"""
+    pairs = find_season(con, video, season, lang_pref)
+    want = parse_episode_filter(episodes, [ep for ep, _ in pairs])
+    return [(ep, cands[0]) for ep, cands in pairs if ep in want]
+
+
+def series_label(video, picks):
+    for _ep, c in picks:
+        if c.get("cnname"):
+            return c["cnname"]
+    for _ep, c in picks:
+        if c.get("enname"):
+            return c["enname"]
+    return video["stem"]
+
+
+def build_season_zip(con, video, season, lang_pref=None, episodes=None):
+    """把整季最佳字幕打成一个 zip，返回 (bytes, 清单)。"""
+    import zipfile
+
+    picks = season_pick(con, video, season, lang_pref, episodes)
+    if not picks:
+        return None, []
+    buf = io.BytesIO()
+    manifest = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for ep, c in picks:
+            ext = "." + (c["ext"] or "srt")
+            lang = PLAYER_LANG.get(c["lang"], "zh")
+            fn = f"S{season:02d}E{ep:02d}.{lang}{ext}"
+            tmp = Path(tempfile.mkdtemp()) / fn
+            try:
+                n, data = materialize(con, c, tmp)
+            except Exception as e:
+                manifest.append((ep, fn, 0, f"失败: {e}"))
+                continue
+            data, enc = normalize_text_bytes(data)
+            z.writestr(fn, data)
+            manifest.append((ep, fn, len(data), enc))
+    return buf.getvalue(), manifest
+
+
+def cmd_season(args):
+    con = sqlite3.connect(args.db)
+    con.row_factory = sqlite3.Row
+    p = Path(args.target).expanduser()
+    name = p.name if p.is_file() else args.target
+    video = parse_video_name(name)
+    season = args.season if args.season is not None else video["season"]
+    if season is None:
+        print("没能从输入里识别出季号。请显式指定，例如： ./run.sh match season \"权力的游戏\" -s 8")
+        return 2
+
+    pref = {a.strip() for a in args.lang.split(",") if a.strip()} if args.lang else None
+    groups = season_groups(con, video, season, pref)
+    if not groups:
+        print(f"没找到《{name}》第 {season} 季的字幕。")
+        return 1
+
+    g = groups[0]
+    pairs = g["pairs"]
+    print(f"《{g['label']}》第 {season} 季 —— 共 {len(pairs)} 集有字幕\n")
+    for ep, cands in pairs:
+        b = cands[0]
+        print(f"  S{season:02d}E{ep:02d}  {LANG_LABEL.get(b['lang'],'?'):<4} "
+              f"{len(cands):>3} 个候选    {b['inner_path'].rsplit('/', 1)[-1][:62]}")
+    if len(groups) > 1:
+        print(f"\n  ⚠️  「{name}」还匹配到 {len(groups)-1} 个相近的剧集分组，"
+              f"可能不是同一部剧：")
+        for o in groups[1:6]:
+            print(f"      ·《{o['label']}》 {len(o['pairs'])} 集   "
+                  f"(series_key={o['series_key'] or '-'})")
+
+    if not args.out and not args.zip:
+        print(f"\n（只是预览。加 --out 目录 或 --zip 文件 才会真正导出）")
+        return 0
+
+    picks = [(ep, cands[0]) for ep, cands in pairs
+             if ep in parse_episode_filter(args.episodes, [e for e, _ in pairs])]
+    if args.zip:
+        data, manifest = build_season_zip(con, video, season, pref, args.episodes)
+        out = Path(args.zip).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        print(f"\n✅ 已打包 {len(manifest)} 集 -> {out}  ({len(data)/1024:.0f} KB)")
+        return 0
+
+    outdir = Path(args.out).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    ok = 0
+    for ep, c in picks:
+        ext = "." + (c["ext"] or "srt")
+        lang = PLAYER_LANG.get(c["lang"], "zh")
+        dest = outdir / f"S{season:02d}E{ep:02d}.{lang}{ext}"
+        try:
+            n, data = materialize(con, c, dest)
+            data, enc = normalize_text_bytes(data)
+            if enc != "utf-8":
+                dest.write_bytes(data)
+            ok += 1
+        except Exception as e:
+            print(f"  !! S{season:02d}E{ep:02d}: {e}")
+    print(f"\n✅ 已导出 {ok} 集到 {outdir}")
+    print(f"   文件名形如 S{season:02d}E01.zh.ass，放进剧集目录即可被播放器识别。")
+    con.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI: find
+# ---------------------------------------------------------------------------
+def cmd_find(args):
+    con = sqlite3.connect(args.db)
+    con.row_factory = sqlite3.Row
+    raw = args.target
+    p = Path(raw).expanduser()
+    is_file = p.is_file()
+    name = p.name if is_file else raw
+    video = parse_video_name(name)
+
+    print(f"解析: {name}")
+    print(f"  release_key = {video['release_key']}")
+    print(f"  series_key  = {video['series_key']}")
+    print(f"  title_key   = {video['title_key']}")
+    print(f"  season/ep   = {video['season']}/{video['episode']}   year = {video['year']}")
+    print()
+
+    pref = None
+    if args.lang:
+        pref = {a.strip() for a in args.lang.split(",") if a.strip()}
+    cands = find_candidates(con, video, limit=args.limit * 20, lang_pref=pref)
+
+    if not cands:
+        print("没有找到匹配的字幕。")
+        print("提示：试试 `search-raw` 直接按片名关键字搜，或去掉文件名里的杂项。")
+        return 1
+
+    print(f"命中 {len(cands)} 条候选，前 {min(args.limit, len(cands))} 条：\n")
+    for i, c in enumerate(cands[: args.limit]):
+        tag = LANG_LABEL.get(c["lang"], c["lang"] or "?")
+        print(f"[{i}] L{c['_level']:.0f} score={c['_score']:.0f}  {tag:<4} .{c['ext']:<3} "
+              f"{(str(c['size']) + 'B') if (c['size'] or 0) > 0 else '   ?':>9}")
+        title = c["cnname"] or (c["series_key"] or "").replace(".", " ").strip() or "-"
+        print(f"    {title} | {c['enname'] or '-'}")
+        print(f"    {c['inner_path']}")
+        print(f"    依据: {c['_why']}")
+        print(f"    来源: {c['fullpath']}")
+        print()
+
+    if args.dry_run:
+        return 0
+
+    best = cands[0]
+    if is_file:
+        if args.out:
+            dest = Path(args.out).expanduser()
+            if dest.is_dir() or args.out.endswith("/"):
+                dest = subtitle_target_path(p, best).name
+                dest = Path(args.out).expanduser() / dest
+        else:
+            dest = subtitle_target_path(p, best)
+    else:
+        dest = Path(args.out or ".").expanduser() / (
+            Path(best["inner_path"]).name)
+
+    n, data = materialize(con, best, dest)
+    data, enc = normalize_text_bytes(data)
+    if enc != "utf-8":
+        with open(dest, "wb") as f:
+            f.write(data)
+    print(f"✅ 已写出: {dest}  ({n} 字节, 原编码 {enc} -> UTF-8)")
+    print(f"   播放器通常会自动加载同目录同名的 .zh.srt / .zh.ass 字幕。")
+    return 0
+
+
+def cmd_serve(args):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    con = sqlite3.connect(args.db, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    state = {"con": con}
+
+    PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地语料检索</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;
+     background:#14161a;color:#e8eaed}
+header{padding:22px 24px 14px;border-bottom:1px solid #262a31;position:sticky;top:0;
+       background:#14161aee;backdrop-filter:blur(12px);z-index:5}
+h1{margin:0 0 12px;font-size:17px;font-weight:600;letter-spacing:.3px}
+h1 span{color:#7c8797;font-weight:400;font-size:13px;margin-left:8px}
+form{display:flex;gap:8px;flex-wrap:wrap}
+input[type=search],select{background:#1d2026;border:1px solid #2e333c;color:#e8eaed;
+  padding:9px 12px;border-radius:9px;font-size:14px;outline:none}
+input[type=search]{flex:1;min-width:220px}
+input[type=search]:focus,select:focus{border-color:#4c8dff}
+button{background:#2f6fed;color:#fff;border:0;padding:9px 18px;border-radius:9px;
+  font-size:14px;font-weight:600;cursor:pointer}
+button:hover{background:#4280f5}
+main{padding:18px 24px 60px}
+.hint{color:#7c8797;font-size:13px;padding:8px 0}
+.row{display:flex;gap:14px;align-items:flex-start;padding:13px 15px;margin-bottom:8px;
+  background:#1a1d23;border:1px solid #262a31;border-radius:11px}
+.row:hover{border-color:#39414d}
+.badge{flex:0 0 auto;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;
+  background:#243447;color:#7fb0ff;min-width:44px;text-align:center}
+.badge.l3{background:#1e3d2b;color:#6fdc9a}
+.badge.l2{background:#243447;color:#7fb0ff}
+.badge.l1{background:#3a3320;color:#e8c46a}
+.meta{flex:1;min-width:0}
+.title{font-weight:600;margin-bottom:2px}
+.title em{font-style:normal;color:#8b94a3;font-weight:400;margin-left:8px;font-size:13px}
+.path{color:#77808f;font-size:12.5px;font-family:ui-monospace,Menlo,monospace;
+  word-break:break-all;margin-top:3px}
+.why{color:#5f6a7a;font-size:12px;margin-top:4px}
+.act{flex:0 0 auto;display:flex;gap:6px;align-items:center}
+a.dl{text-decoration:none;background:#2f6fed;color:#fff;padding:7px 14px;border-radius:8px;
+  font-size:13px;font-weight:600;white-space:nowrap}
+a.dl:hover{background:#4280f5}
+a.dl.alt{background:#262a31;color:#c3cad6}
+a.dl.alt:hover{background:#323844}
+.banner{display:flex;gap:14px;align-items:center;justify-content:space-between;
+  padding:14px 16px;margin-bottom:14px;border-radius:11px;
+  background:linear-gradient(100deg,#1d2a44,#1a1d23);border:1px solid #2b4468}
+.banner b{font-size:15px}
+.banner small{display:block;color:#8b94a3;margin-top:3px;font-weight:400}
+a.pack{text-decoration:none;background:#2f6fed;color:#fff;padding:9px 18px;border-radius:9px;
+  font-size:14px;font-weight:700;white-space:nowrap}
+a.pack:hover{background:#4280f5}
+.ep{display:flex;gap:12px;align-items:center;padding:11px 15px;margin-bottom:7px;
+  background:#1a1d23;border:1px solid #262a31;border-radius:10px}
+.ep .no{font-weight:700;color:#7fb0ff;min-width:62px;font-family:ui-monospace,Menlo,monospace}
+</style></head><body>
+<header>
+  <h1>本地语料检索 <span>__COUNT__ 条记录已索引</span></h1>
+  <form method="get" action="/">
+    <input type="search" name="q" placeholder="片名 / 剧名 / 视频文件名；加季号可整季下载，例如 权力的游戏 S08"
+           value="__Q__" autofocus>
+    <select name="lang">
+      <option value="">语言不限</option>
+      <option value="chs"__S1__>简体</option>
+      <option value="chs_eng"__S2__>简英双语</option>
+      <option value="cht"__S3__>繁体</option>
+      <option value="cht_eng"__S4__>繁英双语</option>
+      <option value="eng"__S5__>英文</option>
+    </select>
+    <button type="submit">搜索</button>
+  </form>
+</header><main>__BODY__</main></body></html>"""
+
+    def render(q, lang, rows, note="", empty_hint=True):
+        body = []
+        if note:
+            body.append(f'<div class="hint">{note}</div>')
+        for r in rows:
+            lvl = int(r["_level"])
+            tag = LANG_LABEL.get(r["lang"], r["lang"] or "?")
+            qs = urllib.parse.urlencode({"fp": r["fullpath"], "ip": r["inner_path"]})
+            size = f'{r["size"]:,} 字节' if (r["size"] or 0) > 0 else "大小未知"
+            body.append(
+                f'<div class="row"><div class="badge l{lvl}">{tag}</div>'
+                f'<div class="meta"><div class="title">{html.escape(r["cnname"] or "-")}'
+                f'<em>{html.escape(r["enname"] or "")}</em></div>'
+                f'<div class="path">{html.escape(r["inner_path"])}</div>'
+                f'<div class="why">{html.escape(r["_why"])} · '
+                f'{size} · {r["ext"]}</div></div>'
+                f'<div class="act"><a class="dl" href="/get?{qs}">下载</a>'
+                f'<a class="dl alt" href="/get?{qs}&amp;conv=1">转UTF-8</a></div></div>')
+        if not rows and not note and empty_hint:
+            body.append('<div class="hint">没有结果。试试只输入片名，或换用英文名。</div>')
+        page = PAGE
+        page = page.replace("__COUNT__", "{:,}".format(state["n"]))
+        page = page.replace("__Q__", html.escape(q or ""))
+        for i, v in enumerate(["chs", "chs_eng", "cht", "cht_eng", "eng"], 1):
+            page = page.replace(f"__S{i}__", " selected" if lang == v else "")
+        page = page.replace("__BODY__", "".join(body))
+        return page.encode("utf-8")
+
+    def render_season(q, lang, video, season, groups):
+        """整季视图：按集列出最佳字幕 + 一键打包下载。"""
+        body = []
+        pairs = groups[0]["pairs"]
+        zq = urllib.parse.urlencode({"q": groups[0]["series_key"] or q,
+                                     "season": season, "lang": lang})
+        label = groups[0]["label"]
+        total_size = sum((c[0]["size"] or 0) for _e, c in pairs)
+        body.append(
+            f'<div class="banner"><div><b>《{html.escape(label)}》第 {season} 季 —— '
+            f'{len(pairs)} 集有字幕</b><small>每集自动挑最优一条（优先简英双语 / 简体）。'
+            f'合计约 {total_size/1e6:.1f} MB</small></div>'
+            f'<a class="pack" href="/season.zip?{zq}">⬇︎ 打包下载整季</a></div>')
+        for ep, cands in pairs:
+            b = cands[0]
+            tag = LANG_LABEL.get(b["lang"], b["lang"] or "?")
+            qs = urllib.parse.urlencode({"fp": b["fullpath"], "ip": b["inner_path"]})
+            body.append(
+                f'<div class="ep"><div class="no">S{season:02d}E{ep:02d}</div>'
+                f'<div class="badge l{int(b["_level"])}">{tag}</div>'
+                f'<div class="meta"><div class="path">{html.escape(b["inner_path"])}</div>'
+                f'<div class="why">{len(cands)} 个候选 · {html.escape(b["_why"])}</div></div>'
+                f'<div class="act"><a class="dl" href="/get?{qs}&amp;conv=1">下载</a></div></div>')
+        if len(groups) > 1:
+            alts = []
+            for o in groups[1:6]:
+                aq = urllib.parse.urlencode({"q": o["series_key"], "season": season,
+                                             "lang": lang})
+                alts.append(f'<a class="dl alt" href="/?{aq}">《{html.escape(o["label"])}》'
+                            f' {len(o["pairs"])} 集</a>')
+            body.append(
+                f'<div class="hint" style="margin-top:18px">⚠️ 「{html.escape(q)}」'
+                f'还匹配到 {len(groups)-1} 个相近的剧集分组，可能不是同一部剧；'
+                f'点开看看：<br>{" ".join(alts)}</div>')
+        return render(q, lang, [], "", empty_hint=False).replace(
+            b"<main>", b"<main>" + "".join(body).encode("utf-8"), 1)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, data, ctype, filename=None):
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            if filename:
+                self.send_header(
+                    "Content-Disposition",
+                    "attachment; filename*=UTF-8''" + urllib.parse.quote(filename))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+
+            if u.path == "/season.zip":
+                q = (qs.get("q", [""])[0] or "").strip()
+                lang = qs.get("lang", [""])[0]
+                season = qs.get("season", [""])[0]
+                if not q or not season.isdigit():
+                    self.send_error(400, "missing q/season")
+                    return
+                v = parse_video_name(q)
+                pref = {lang} if lang else None
+                data, manifest = build_season_zip(state["con"], v, int(season), pref)
+                if not data:
+                    self.send_error(404, "no subtitles for this season")
+                    return
+                self._send(data, "application/zip", f"S{int(season):02d}.zip")
+                return
+
+            if u.path == "/get":
+                fullpath = qs.get("fp", [""])[0]
+                inner = qs.get("ip", [""])[0]
+                conv = qs.get("conv", ["0"])[0] == "1"
+                r = state["con"].execute(
+                    "SELECT * FROM subs WHERE fullpath=? AND inner_path=?",
+                    (fullpath, inner)).fetchone()
+                if not r:
+                    self.send_error(404)
+                    return
+                tmp = Path(tempfile.mkdtemp()) / Path(inner).name
+                try:
+                    materialize(state["con"], dict(r), tmp)
+                except Exception as e:
+                    self.send_error(500, str(e))
+                    return
+                data = tmp.read_bytes()
+                fn = Path(inner).name
+                if conv:
+                    data, enc = normalize_text_bytes(data)
+                    stem, ext = os.path.splitext(fn)
+                    fn = f"{stem}.utf8{ext}"
+                self._send(data, "application/octet-stream", fn)
+                return
+
+            q = (qs.get("q", [""])[0] or "").strip()
+            lang = qs.get("lang", [""])[0]
+            if not q:
+                self._send(render("", lang, [], ""), "text/html; charset=utf-8")
+                return
+
+            v = parse_video_name(q)
+            pref = {lang} if lang else None
+
+            # 整季模式：查询里带季、不带集
+            if v["season_only"]:
+                groups = season_groups(state["con"], v, v["season"], pref)
+                if groups:
+                    self._send(render_season(q, lang, v, v["season"], groups),
+                               "text/html; charset=utf-8")
+                    return
+                note = (f"解析：“{html.escape(q)}” → 第 {v['season']} 季，"
+                        f"但没有找到整季字幕，下面按片名列出全部结果")
+                rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)[:120]
+                self._send(render(q, lang, rows, note), "text/html; charset=utf-8")
+                return
+
+            rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)[:120]
+            ep_txt = ""
+            if v["season"] is not None:
+                ep_txt = f" S{v['season']:02d}E{(v['episode'] or 0):02d}"
+            note = (f"解析：“{html.escape(q)}” → 片名 token "
+                    f"[{html.escape(v['title_key'])}]{ep_txt}，命中 {len(rows)} 条")
+            if v["season"] is not None:
+                zq = urllib.parse.urlencode({"q": v["series_key"] or q,
+                                             "season": v["season"], "lang": lang})
+                note += (f' · <a style="color:#7fb0ff" href="/?{zq}">'
+                         f'查看第 {v["season"]} 季整季 →</a>')
+            self._send(render(q, lang, rows, note), "text/html; charset=utf-8")
+
+    state["n"] = con.execute("SELECT count(*) FROM subs").fetchone()[0]
+    srv = ThreadingHTTPServer((args.host, args.port), H)
+    url = f"http://{args.host}:{args.port}/"
+    print(f"检索页已启动: {url}")
+    print(f"索引 {state['n']:,} 条记录。Ctrl-C 退出。")
+    if args.open:
+        subprocess.Popen(["open", url])
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止。")
+
+
+# ---------------------------------------------------------------------------
+# CLI: scan
+# ---------------------------------------------------------------------------
+def cmd_scan(args):
+    root = Path(args.dir).expanduser()
+    vids = [p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in VIDEO_EXT
+            and not any(x in str(p) for x in args.exclude)]
+    print(f"扫描 {root}：找到 {len(vids)} 个视频文件")
+    con = sqlite3.connect(args.db)
+    con.row_factory = sqlite3.Row
+
+    hit = miss = skip = 0
+    miss_list = []
+    for i, v in enumerate(vids, 1):
+        existing = [p for p in v.parent.glob(v.stem + ".*")
+                    if p.suffix.lower() in SUB_EXT]
+        if existing and not args.force:
+            skip += 1
+            continue
+        video = parse_video_name(v.name)
+        cands = find_candidates(con, video, limit=50)
+        if not cands:
+            miss += 1
+            miss_list.append(str(v))
+            continue
+        hit += 1
+        if args.apply:
+            best = cands[0]
+            dest = subtitle_target_path(v, best)
+            try:
+                n, data = materialize(con, best, dest)
+                data, enc = normalize_text_bytes(data)
+                if enc != "utf-8":
+                    dest.write_bytes(data)
+                print(f"  ✅ {v.name}  ->  {dest.name}  [{LANG_LABEL.get(best['lang'],'?')}]")
+            except Exception as e:
+                print(f"  !! {v.name}: {e}")
+        else:
+            print(f"  {'✓' if cands[0]['_level'] >= 2 else '~'} {v.name}  "
+                  f"[{LANG_LABEL.get(cands[0]['lang'],'?')}] {cands[0]['inner_path'][:70]}")
+    print(f"\n命中 {hit} / 缺失 {miss} / 已有字幕跳过 {skip}")
+    if miss_list:
+        out = INDEX_DIR / "scan_missing.txt"
+        out.write_text("\n".join(miss_list), encoding="utf-8")
+        print(f"未命中的清单 -> {out}")
+        for m in miss_list[:15]:
+            print(f"   缺: {m}")
+    con.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("build-subs", help="建立匹配索引（约 1 分钟）")
+    p.add_argument("--db", default=str(DB_PATH))
+
+    p = sub.add_parser("find", help="给一个视频文件/名字找字幕")
+    p.add_argument("target")
+    p.add_argument("--db", default=str(DB_PATH))
+    p.add_argument("--lang", help="逗号分隔，如 chs,chs_eng")
+    p.add_argument("--limit", type=int, default=8)
+    p.add_argument("--out", help="输出文件或目录")
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("season", help="整季检索 / 整季导出")
+    p.add_argument("target", help="剧名，例如 \"权力的游戏\"")
+    p.add_argument("-s", "--season", type=int, help="季号（输入里已含季号可省略）")
+    p.add_argument("--db", default=str(DB_PATH))
+    p.add_argument("--lang", help="逗号分隔，如 chs,chs_eng")
+    p.add_argument("--episodes", help="只导部分集，如 1-5,8,10")
+    p.add_argument("--out", help="导出到目录")
+    p.add_argument("--zip", help="打包成一个 zip 文件")
+
+    p = sub.add_parser("scan", help="批量扫描影音库")
+    p.add_argument("dir")
+    p.add_argument("--db", default=str(DB_PATH))
+    p.add_argument("--apply", action="store_true", help="真的写出字幕")
+    p.add_argument("--force", action="store_true", help="已有字幕也覆盖")
+    p.add_argument("--exclude", nargs="*", default=["Sample", "sample", "Extras"])
+
+    p = sub.add_parser("serve", help="起本地网页检索")
+    p.add_argument("--db", default=str(DB_PATH))
+    p.add_argument("--host", default=HOST)
+    p.add_argument("--port", type=int, default=PORT)
+    p.add_argument("--open", action=argparse.BooleanOptionalAction,
+                   default=AUTO_OPEN_BROWSER, help="启动后自动打开浏览器")
+
+    a = ap.parse_args()
+    if a.cmd == "build-subs":
+        build_subs(a.db)
+    elif a.cmd == "find":
+        sys.exit(cmd_find(a))
+    elif a.cmd == "season":
+        sys.exit(cmd_season(a))
+    elif a.cmd == "scan":
+        cmd_scan(a)
+    elif a.cmd == "serve":
+        cmd_serve(a)
+
+
+if __name__ == "__main__":
+    main()

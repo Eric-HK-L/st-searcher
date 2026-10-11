@@ -1,0 +1,39 @@
+MIT License
+
+Copyright (c) 2026 local-corpus-search contributors
+
+=== 适用范围 / Scope ===
+
+本许可证仅适用于本仓库中的**源代码与文档**。
+
+它**不适用于**：
+  - `dataset/` 目录中的任何语料数据（本仓库不分发任何数据）
+  - 用户自行放入 `storage/meta/` 的第三方元数据
+  - 通过本工具检索、取出的任何第三方内容
+
+这些内容的权利归各自的权利人所有。
+
+This license applies ONLY to the source code and documentation in this
+repository. It does NOT apply to any corpus data, third-party metadata,
+or any content retrieved through this tool. All such content remains the
+property of its respective rights holders.
+
+=== MIT 正文 / MIT Text ===
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

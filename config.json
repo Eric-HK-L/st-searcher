@@ -1,0 +1,9 @@
+{
+  "corpus_dir": "dataset",
+  "split_archive": "data.zip",
+  "split_parts": 4,
+  "extra_archives": ["data2.zip"],
+  "host": "127.0.0.1",
+  "port": 8777,
+  "auto_open_browser": true
+}
