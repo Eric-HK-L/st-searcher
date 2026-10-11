@@ -1823,6 +1823,14 @@ def cmd_serve(args):
     try{ localStorage.setItem(K, n); }catch(e){}
     label();
   };
+  window.__toggleAll=function(){
+    var ds=document.querySelectorAll('details.epblock'), i;
+    var anyClosed=false;
+    for(i=0;i<ds.length;i++){ if(!ds[i].open){ anyClosed=true; break; } }
+    for(i=0;i<ds.length;i++){ ds[i].open=anyClosed; }
+    var b=document.getElementById('expandall');
+    if(b){ b.textContent = anyClosed ? '全部收起' : '全部展开'; }
+  };
   document.addEventListener('DOMContentLoaded', label);
 })();
 </script>
@@ -1982,11 +1990,21 @@ a.pack:hover{background:var(--accent-h)}
 /* ---- 分集下载 ---- */
 .epblock{margin-bottom:12px;border:1px solid var(--line);border-radius:11px;
   background:var(--card);overflow:hidden;box-shadow:var(--shadow)}
-.ephead{display:flex;gap:10px;align-items:center;padding:10px 14px;
-  background:var(--input);border-bottom:1px solid var(--line)}
+/* 用原生 <details> 折叠：默认收起，用户先扫集号再展开自己要看的那集 */
+.epblock>summary{cursor:pointer;list-style:none;display:flex;gap:10px;align-items:center;
+  padding:11px 14px;background:var(--input);border-bottom:1px solid transparent}
+.epblock[open]>summary{border-bottom-color:var(--line)}
+.epblock>summary::-webkit-details-marker{display:none}
+.epblock>summary::before{content:"▸";color:var(--fg4);font-size:11px;flex:0 0 auto;
+  transition:transform .15s}
+.epblock[open]>summary::before{content:"▾"}
+.epblock>summary:hover{background:var(--card)}
 .ephead .no{font-weight:700;color:var(--link);font-family:ui-monospace,Menlo,monospace;
-  font-size:14px;min-width:64px}
-.ephead .cnt{color:var(--fg3);font-size:12.5px;flex:1}
+  font-size:14px;min-width:64px;flex:0 0 auto}
+.ephead .cnt{color:var(--fg3);font-size:12.5px;flex:0 0 auto}
+.ephead .prev{flex:1;min-width:0;color:var(--fg4);font-size:12px;
+  font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;text-align:right}
 .ver{display:flex;gap:10px;align-items:center;padding:9px 14px;
   border-bottom:1px solid var(--line);font-size:13px}
 .ver:last-child{border-bottom:0}
@@ -2150,7 +2168,8 @@ a.pack:hover{background:var(--accent-h)}
                     f'<div class="sub">共 {len(pairs)} {unit} · {n_ver} 个版本 · '
                     f'约 {total / 1e6:.1f} MB</div></div>')
         body.append('<div class="note">每一集有哪些版本就列哪些，按需挑一个下载 —— '
-                    '工具不做推荐。要整季打包请到「整季下载」，那里每个版本一个包。</div>')
+                    '工具不做推荐。集号默认收起，点一下展开该集全部版本；'
+                    '要整季打包请到「整季下载」，那里每个版本一个包。</div>')
 
         sizes = []
         for n in (4, 8, 16, 32):
@@ -2158,15 +2177,23 @@ a.pack:hover{background:var(--accent-h)}
             d["per"] = n
             d["page"] = 1
             sizes.append(f'<a class="pg" href="/?{urllib.parse.urlencode(d)}">{n} 集/页</a>')
-        body.append(f'<div class="toolbar"><span>第 {page}/{pages} 页 · 每页 {per} 集</span>'
-                    f'{"".join(sizes)}</div>')
+        body.append(f'<div class="toolbar"><span>第 {page}/{pages} 页 · 每页 {per} 集 · '
+                    f'点集号展开</span>'
+                    f'<a href="#" id="expandall" onclick="__toggleAll();return false;">'
+                    f'全部展开</a>{"".join(sizes)}</div>')
 
         for ep, cands in chunk:
             epno = ("SP%02d" % ep) if season == 0 else ("S%02dE%02d" % (season, ep))
             rows = "".join(_ver_row(c) for c in cands)
-            body.append(f'<div class="epblock"><div class="ephead">'
-                        f'<span class="no">{epno}</span>'
-                        f'<span class="cnt">{len(cands)} 个版本</span></div>{rows}</div>')
+            first = cands[0]
+            prev = first["inner_path"].rsplit("/", 1)[-1]
+            body.append(
+                f'<details class="epblock"><summary class="ephead">'
+                f'<span class="no">{epno}</span>'
+                f'<span class="cnt">{len(cands)} 个版本</span>'
+                f'<span class="prev">{html.escape(prev[:70])} · '
+                f'{fmt_size(first["size"])}</span>'
+                f'</summary>{rows}</details>')
 
         body.append(_page_bar(base, page, pages))
 
