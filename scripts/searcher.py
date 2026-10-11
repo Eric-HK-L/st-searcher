@@ -1060,12 +1060,90 @@ def _specials_pairs(con, video, lang_pref=None):
     return out
 
 
-def series_overview(con, video, lang_pref=None):
-    """按剧名检索 -> 按季汇总，主分组在前。
+_MERGE_SEASON_RE = re.compile(r"第\s*[0-9一二三四五六七八九十百]+\s*[季集话話部]")
 
-    返回 [{"series_key","label","seasons":[(season, pairs, packs)],"primary"}, ...]
-    没有季集信息的结果（电影等）不参与汇总。
+
+def _merge_name(x):
+    """合并分组时用的「剧名指纹」。
+
+    只去掉季集标记和空白标点，**保留方括号里的内容** ——
+    因为剧名常常就写在括号里：`【行尸走肉】精校字幕合集`。
+    用 _norm_title（会把括号整段删掉）当指纹的话，一堆不同的剧
+    都会变成 `精校字幕合集`，然后被误并成同一部。
     """
+    x = _MERGE_SEASON_RE.sub("", x or "")
+    return re.sub(r"[\s\-_·:：,，、.。~～!！?？]+", "", x)
+
+
+def _merge_series_groups(by_series, cn_by_series):
+    """把「同一部剧的不同 series_key 写法」并成一组。
+
+    搜「实习医生格蕾」会同时命中三个 series_key：
+        greys.anatomy / grey.s.anatomy / 实习医生格蕾
+    它们其实是同一部剧。不合并的话主分组可能落在只有 3 季的那个上，
+    用户就只看到 3 季（这正是之前的 bug）。
+
+    两种判据（任一命中就合并）：
+      · series_key 去掉标点后相同 —— greys.anatomy == grey.s.anatomy
+      · 归档中文名的众数相同 —— 三个写法背后都是「实习医生格蕾」
+    """
+    items = list(by_series)
+    tags = {}
+    for sk in items:
+        t = {"k:" + re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", sk.lower())}
+        # 中文名只用来「补充」同一 pattern 的判断：只有当两个 series_key
+        # 既去标点相同、又共用同一个中文名时才并。单靠中文名并过 ——
+        # 「【行尸走肉】精校字幕合集」和「【天堂执法者】精校字幕合集」
+        # 去掉方括号后都是「精校字幕合集」，不同的剧会被并成一部。
+        c = cn_by_series.get(sk)
+        if c:
+            name, _n = c.most_common(1)[0]
+            fp = _merge_name(name)
+            if len(fp) >= 3:
+                t.add("n:" + fp)
+        tags[sk] = t
+
+    parent = {sk: sk for sk in items}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    # 只用 k 标签（去标点后的 series_key）合并：这是安全判据。
+    # 中文名标签太容易把不同的剧并到一起，只留着做诊断。
+    seen = {}
+    for sk in items:
+        for tag in tags[sk]:
+            if not tag.startswith("k:"):
+                continue
+            if tag in seen:
+                ra, rb = find(seen[tag]), find(sk)
+                if ra != rb:
+                    parent[rb] = ra
+            else:
+                seen[tag] = sk
+    merged = {}
+    for sk in items:
+        merged.setdefault(find(sk), []).append(sk)
+    return list(merged.values())
+
+
+def _count_versions(pairs):
+    """一季里「能覆盖多集」的发布版本数 —— 跟 season_versions 同一套判据。"""
+    total = len(pairs)
+    fam = {}
+    for ep, cands in pairs:
+        for c in cands:
+            f = release_family(c["release_key"]) or (c["series_key"] or "?")
+            fam.setdefault(f, set()).add(ep)
+    floor = min(2, total)
+    return sum(1 for eps in fam.values() if len(eps) >= floor)
+
+
+def series_overview(con, video, lang_pref=None):
+    """按剧名检索 -> 按季汇总，主分组在前。"""
     v = dict(video)
     v["season"] = None
     v["episode"] = None
@@ -1074,41 +1152,59 @@ def series_overview(con, video, lang_pref=None):
         find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True, sql_cap=60000),
         lang_pref, ignore_episode=True))
 
-    by_series = {}
+    by_series, cn_by_series = {}, {}
     for c in cands:
         if c["season"] is None or c["season"] == 0:
             continue          # 特别篇单独追加，不参与按季分组
-        by_series.setdefault(c["series_key"] or "", {}) \
-                 .setdefault(c["season"], {}) \
+        sk = c["series_key"] or ""
+        by_series.setdefault(sk, {}).setdefault(c["season"], {}) \
                  .setdefault(c["episode"], []).append(c)
+        if c.get("cnname"):
+            cn_by_series.setdefault(sk, Counter())[c["cnname"]] += 1
 
     groups = []
-    for sk, seasons in by_series.items():
+    for sks in _merge_series_groups(by_series, cn_by_series):
+        # 代表 key 取条目最多的那个：链出去的查询才覆盖得全
+        rep = max(sks, key=lambda k: sum(len(cs) for se in by_series[k].values()
+                                         for cs in se.values()))
         seasons_out = []
-        for se in sorted(seasons):
-            pairs = sorted(seasons[se].items())
-            seasons_out.append((se, pairs, season_versions(con, v, se, lang_pref)))
+        for se in sorted({x for k in sks for x in by_series[k]}):
+            eps = {}
+            for k in sks:
+                for ep, cs in by_series[k].get(se, {}).items():
+                    eps.setdefault(ep, []).extend(cs)
+            pairs = [(ep, sorted(cs, key=lambda z: (-z["_score"], z["inner_path"])))
+                     for ep, cs in sorted(eps.items())]
+            seasons_out.append((se, pairs, _count_versions(pairs)))
         flat = [c for _se, pairs, _pk in seasons_out for _ep, cs in pairs for c in cs]
-        groups.append({"series_key": sk,
+        groups.append({"series_key": rep, "sks": set(sks),
                        "label": series_label([c.get("cnname") for c in flat],
-                                             [c.get("enname") for c in flat], sk),
+                                             [c.get("enname") for c in flat], rep),
                        "seasons": seasons_out, "primary": False})
+
     if not groups:
         return []
-    groups.sort(key=lambda g: -sum(len(p) for _s, p, _k in g["seasons"]))
-    exact = [g for g in groups if g["series_key"] == (v.get("series_key") or "")]
-    primary = exact[0] if exact else groups[0]
+    size = lambda g: sum(len(p) for _s, p, _k in g["seasons"])   # noqa: E731
+    groups.sort(key=lambda g: -size(g))
+    # 以前这里无条件优先「查询词和 series_key 完全相同」的那组。中文名搜索会踩坑：
+    # 搜「实习医生格蕾」时，字面就叫「实习医生格蕾」的那组只有 3 季，
+    # 而真正的正片 greys.anatomy 有 19 季 —— 结果用户只看到 3 季。
+    # 现在只在精确命中的那组规模够大时才优先它，否则以内容最多的为准。
+    exact = [g for g in groups if (v.get("series_key") or "") in g["sks"]]
+    primary = groups[0]
+    if exact and size(exact[0]) >= 0.5 * size(groups[0]):
+        primary = exact[0]
     primary["primary"] = True
 
     # 特别篇（season=0）。它们的 series_key 未必和正片一致
     # （Downton.Abbey.Christmas.Special -> downton.abbey.christmas），
-    # 所以这里用主分组的 series_key 去前缀匹配，找到后并进季列表，排在最后。
+    # 所以用主分组的 series_key 去前缀匹配，找到后并进季列表，排在最后。
     sv = dict(v)
     sv["series_key"] = primary["series_key"]
     sp = _specials_pairs(con, sv, lang_pref)
     if sp:
         primary["seasons"] = primary["seasons"] + [
-            (0, sp, season_versions(con, sv, 0, lang_pref))]
+            (0, sp, _count_versions(sp))]
 
     return [primary] + [g for g in groups if g is not primary]
 
@@ -1949,9 +2045,7 @@ a.pack:hover{background:var(--accent-h)}
         qs = urllib.parse.urlencode({"fp": c["fullpath"], "ip": c["inner_path"]})
         size = fmt_size(c["size"])
         name = c["inner_path"].rsplit("/", 1)[-1]
-        best = ' best' if c.get("_best") else ''
-        star = '★' if c.get("_best") else ''
-        return (f'<div class="ver{best}"><span class="star">{star}</span>'
+        return (f'<div class="ver">'
                 f'<span class="badge l{int(c["_level"])}">{tag}</span>'
                 f'<span class="vpath" title="{html.escape(c["inner_path"])}">'
                 f'{html.escape(name)}</span>'
@@ -1998,61 +2092,49 @@ a.pack:hover{background:var(--accent-h)}
     # ------------------------------------------------------------------
     def render_season(q, lang, video, season, groups, page=1, per=SEASON_PER,
                       show_all=True, theme=None):
-        """整季视图：每集列出**全部版本**，按集分页。"""
+        """分集下载：每一集的**全部版本**都罗列出来，按集分页。
+
+        这里刻意不做任何推荐 —— 用户下载的整季通常是同一个版本，
+        由工具替他挑「最优」反而会让每集版本不一致。要整季打包请到「整季下载」。
+        """
         pairs = groups[0]["pairs"]
         label = groups[0]["label"]
         series_q = groups[0]["series_key"] or q
-
-        n_ver = sum(len(c) for _e, c in pairs)
-        total_size = sum((c[0]["size"] or 0) for _e, c in pairs)
+        n_ver = sum(len(cs) for _e, cs in pairs)
+        total = sum((cs[0]["size"] or 0) for _e, cs in pairs)
 
         pages = max(1, (len(pairs) + per - 1) // per)
         page = min(max(1, page), pages)
         chunk = pairs[(page - 1) * per: page * per]
 
-        body = []
-        base = {"q": series_q, "season": season, "lang": lang, "all": 1 if show_all else 0,
-                "per": per}
+        base = {"q": series_q, "season": season, "lang": lang, "per": per}
         if theme:
             base["theme"] = theme
-        zq = urllib.parse.urlencode({"q": series_q, "season": season, "lang": lang})
-        body.append(_tabs(series_q, lang, season, "episode", theme))
-        body.append(
-            f'<div class="banner"><div><b>《{html.escape(label)}》{season_title(season)} —— '
-            f'{len(pairs)} {"个特别篇" if season == 0 else "集"} / {n_ver} 个版本</b>'
-            f'<small>默认列出每集全部版本，★ 是推荐的那条；合计约 {total_size / 1e6:.1f} MB'
-            f'（仅推荐版）</small></div>'
-            f'<div class="acts"><a class="pack" href="/season.zip?{zq}">'
-            f'⬇︎ 打包整季（每集推荐版）</a>'
-            f'<a class="pack" style="background:var(--input);color:var(--fg2);'
-            f'border:1px solid var(--line2)" href="/season.zip?{zq}&amp;all=1">'
-            f'打包全部版本</a></div></div>')
 
-        flip = dict(base)
-        flip["all"] = 0 if show_all else 1
-        flip["page"] = 1
-        other = "只显示每集推荐版" if show_all else f"显示全部 {n_ver} 个版本"
-        body.append(
-            f'<div class="toolbar"><span>第 {page}/{pages} 页 · 每页 {per} 集</span>'
-            f'<a href="/?{urllib.parse.urlencode(flip)}">{other}</a>'
-            f'<a href="/?{urllib.parse.urlencode({**base, "per": 4, "page": 1})}">4 集/页</a>'
-            f'<a href="/?{urllib.parse.urlencode({**base, "per": 8, "page": 1})}">8 集/页</a>'
-            f'<a href="/?{urllib.parse.urlencode({**base, "per": 16, "page": 1})}">16 集/页</a>'
-            f'</div>')
+        unit = "个特别篇" if season == 0 else "集"
+        body = [_tabs(series_q, lang, season, "episode", theme)]
+        body.append(f'<div class="head"><h2>《{html.escape(label)}》'
+                    f'<span class="sep">/</span>{season_title(season)}</h2>'
+                    f'<div class="sub">共 {len(pairs)} {unit} · {n_ver} 个版本 · '
+                    f'约 {total / 1e6:.1f} MB</div></div>')
+        body.append('<div class="note">每一集有哪些版本就列哪些，按需挑一个下载 —— '
+                    '工具不做推荐。要整季打包请到「整季下载」，那里每个版本一个包。</div>')
+
+        sizes = []
+        for n in (4, 8, 16, 32):
+            d = dict(base)
+            d["per"] = n
+            d["page"] = 1
+            sizes.append(f'<a class="pg" href="/?{urllib.parse.urlencode(d)}">{n} 集/页</a>')
+        body.append(f'<div class="toolbar"><span>第 {page}/{pages} 页 · 每页 {per} 集</span>'
+                    f'{"".join(sizes)}</div>')
 
         for ep, cands in chunk:
-            shown = cands if show_all else cands[:1]
-            for i, c in enumerate(shown):
-                c["_best"] = (i == 0)
-            rows = "".join(_ver_row(c) for c in shown)
-            body.append(
-                f'<div class="epblock"><div class="ephead">'
-                f'<span class="no">{("SP%02d" % ep) if season == 0 else ("S%02dE%02d" % (season, ep))}</span>'
-                f'<span class="cnt">共 {len(cands)} 个版本'
-                + (f'，显示前 1 个' if not show_all and len(cands) > 1 else '')
-                + f' · 推荐：{LANG_LABEL.get(cands[0]["lang"], "?")}'
-                  f' · {html.escape(cands[0]["inner_path"].rsplit("/", 1)[-1][:60])}'
-                f'</span></div>{rows}</div>')
+            epno = ("SP%02d" % ep) if season == 0 else ("S%02dE%02d" % (season, ep))
+            rows = "".join(_ver_row(c) for c in cands)
+            body.append(f'<div class="epblock"><div class="ephead">'
+                        f'<span class="no">{epno}</span>'
+                        f'<span class="cnt">{len(cands)} 个版本</span></div>{rows}</div>')
 
         body.append(_page_bar(base, page, pages))
 
@@ -2063,10 +2145,8 @@ a.pack:hover{background:var(--accent-h)}
                                              "lang": lang})
                 alts.append(f'<a class="pg" href="/?{aq}">《{html.escape(o["label"])}》'
                             f' {len(o["pairs"])} 集</a>')
-            body.append(
-                f'<div class="hint" style="margin-top:18px">⚠️ 「{html.escape(q)}」'
-                f'还匹配到 {len(groups) - 1} 个相近的剧集分组，可能不是同一部剧；'
-                f'点开看看：<br>{" ".join(alts)}</div>')
+            body.append(f'<div class="note">还匹配到 {len(groups) - 1} 个相近分组，'
+                        f'可能不是同一部剧：<div class="altrow">{"".join(alts)}</div></div>')
         return _shell(q, lang, body, theme)
 
     def _tabs(q, lang, season, active, theme=None):
@@ -2101,7 +2181,7 @@ a.pack:hover{background:var(--accent-h)}
                 f'<div class="seasrow"><div class="sleft">'
                 f'<span class="sno">{season_title(se)}</span>'
                 f'<span class="sinfo">{len(pairs)} {unit} · {nf} 个文件 · '
-                f'{len(vers)} 个版本</span></div>'
+                f'{vers} 个版本</span></div>'
                 f'<div class="sright">'
                 f'<a class="btn primary" href="/?{sq}&view=season">整季下载</a>'
                 f'<a class="btn" href="/?{sq}&view=episode">分集下载</a>'
@@ -2273,7 +2353,7 @@ a.pack:hover{background:var(--accent-h)}
                 sv["episode"] = None
                 groups = season_groups(state["con"], sv, want_season, pref)
                 if groups:
-                    view = (qs.get("view", ["episode"])[0] or "episode").lower()
+                    view = (qs.get("view", ["season"])[0] or "season").lower()
                     if view in ("season", "pack"):
                         self._send(render_versions(q, lang, sv, want_season, groups[0], theme),
                                    "text/html; charset=utf-8")
