@@ -763,9 +763,10 @@ def season_groups(con, video, season=None, lang_pref=None):
     v["episode"] = None
     if v["season"] is None:
         return []
-    cands = find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True,
-                            sql_cap=60000)
-    cands = _augment_by_series(con, v, cands, lang_pref, ignore_episode=True)
+    cands = _cached(_cache_key("sg", v, lang_pref), lambda: _augment_by_series(
+        con, v,
+        find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True, sql_cap=60000),
+        lang_pref, ignore_episode=True))
     if getattr(cands, "truncated", False):
         print(f"⚠️  第 {v['season']} 季的候选行数触到了数据库上限，可能有遗漏。",
               file=sys.stderr)
@@ -796,6 +797,32 @@ def season_groups(con, video, season=None, lang_pref=None):
     order = [primary] + [g for g in groups if g is not primary]
     order[0]["primary"] = True
     return order
+
+
+# 索引在服务运行期间是静态的，所以这几个查询可以安全缓存。
+# 剧名总览要做跨语言补全（多跑几轮 SQL），首次约 1 秒，缓存后基本瞬时。
+_CACHE = {}
+_CACHE_MAX = 128
+
+
+def _cache_key(kind, video, extra=None):
+    return (kind,
+            video.get("series_key") or "",
+            video.get("title_key") or "",
+            tuple(video.get("cjk") or []),
+            video.get("season"),
+            video.get("episode"),
+            tuple(sorted(extra)) if extra else None)
+
+
+def _cached(key, fn):
+    if key in _CACHE:
+        return _CACHE[key]
+    out = fn()
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[key] = out
+    return out
 
 
 def _augment_by_series(con, video, cands, lang_pref=None, ignore_episode=False):
@@ -865,9 +892,10 @@ def series_overview(con, video, lang_pref=None):
     v = dict(video)
     v["season"] = None
     v["episode"] = None
-    cands = find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True,
-                            sql_cap=60000)
-    cands = _augment_by_series(con, v, cands, lang_pref, ignore_episode=True)
+    cands = _cached(_cache_key("ov", v, lang_pref), lambda: _augment_by_series(
+        con, v,
+        find_candidates(con, v, lang_pref=lang_pref, ignore_episode=True, sql_cap=60000),
+        lang_pref, ignore_episode=True))
 
     by_series = {}
     for c in cands:
