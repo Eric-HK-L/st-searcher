@@ -228,9 +228,25 @@ def parse_episode(text: str):
     return None, None
 
 
+# 只在这份白名单里的扩展名才会被剥掉。
+# 不能用 Path.stem 无脑剥 —— 对 "Game.of.Thrones.S08E01" 这种
+# 「发布名 + 季集号」的写法，Path 会把 ".S08E01" 当成扩展名吃掉，
+# 结果季集信息整个丢失，搜索退化成「全季全糊匹配」。
+_STRIPPABLE_EXT = (VIDEO_EXT | SUB_EXT
+                   | {".txt", ".nfo", ".torrent", ".mka", ".sub", ".idx"})
+
+
+def _strip_known_ext(name: str) -> str:
+    dot = name.rfind(".")
+    if dot > 0:
+        if name[dot:].lower() in _STRIPPABLE_EXT:
+            return name[:dot]
+    return name
+
+
 def parse_video_name(name: str):
-    """视频文件名 -> 结构化信息。支持整季（只有季没有集）。"""
-    stem = Path(name).stem
+    """视频文件名 / 发布名 -> 结构化信息。支持整季（只有季没有集）。"""
+    stem = _strip_known_ext(Path(name).name)
     base, lang = split_lang(stem)
     season, episode = parse_episode(stem)
     if season is None:
@@ -995,20 +1011,39 @@ def series_label(video, picks):
     return video["stem"]
 
 
-def build_season_zip(con, video, season, lang_pref=None, episodes=None):
-    """把整季最佳字幕打成一个 zip，返回 (bytes, 清单)。"""
+def build_season_zip(con, video, season, lang_pref=None, episodes=None,
+                     variants=False):
+    """把整季打进一个 zip，返回 (bytes, 清单)。
+
+    variants=False  每集只放推荐的那一条（文件名 S01E01.zh.ass，播放器可直接识别）
+    variants=True   每集放全部版本；同名时加 _2 / _3 后缀避免互相覆盖
+    """
     import zipfile
 
-    picks = season_pick(con, video, season, lang_pref, episodes)
+    if variants:
+        groups = season_groups(con, video, season, lang_pref)
+        pairs = groups[0]["pairs"] if groups else []
+        want = parse_episode_filter(episodes, [e for e, _ in pairs])
+        picks = [(ep, c) for ep, cands in pairs if ep in want for c in cands]
+    else:
+        picks = season_pick(con, video, season, lang_pref, episodes)
     if not picks:
         return None, []
+
     buf = io.BytesIO()
     manifest = []
+    used = set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for ep, c in picks:
             ext = "." + (c["ext"] or "srt")
             lang = PLAYER_LANG.get(c["lang"], "zh")
-            fn = f"S{season:02d}E{ep:02d}.{lang}{ext}"
+            base = f"S{season:02d}E{ep:02d}.{lang}"
+            fn = base + ext
+            k = 2
+            while fn in used:                     # 同一集同一语言有多个版本
+                fn = f"{base}_{k}{ext}"
+                k += 1
+            used.add(fn)
             tmp = Path(tempfile.mkdtemp()) / fn
             try:
                 n, data = materialize(con, c, tmp)
@@ -1161,64 +1196,151 @@ def cmd_serve(args):
     con.row_factory = sqlite3.Row
     state = {"con": con}
 
-    PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+    SEARCH_PER = 30          # 普通检索：每页条数
+    SEASON_PER = 8           # 整季视图：每页集数
+
+    PAGE = """<!doctype html><html lang="zh"__THEME__><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>本地语料检索</title>
+<script>
+(function(){
+  var K='corpus-theme', saved=null;
+  try{ saved=localStorage.getItem(K); }catch(e){}
+  var fromUrl = document.documentElement.getAttribute('data-theme');   // ?theme=xxx 由服务端写入
+  var t = saved || fromUrl
+        || ((window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark');
+  document.documentElement.setAttribute('data-theme', t);
+  function label(){ var b=document.getElementById('themebtn');
+    if(b){ var l=document.documentElement.getAttribute('data-theme')==='light';
+           b.textContent = l ? '\\u263E' : '\\u2600';
+           b.title = l ? '切换到暗色' : '切换到亮色'; } }
+  window.__toggleTheme=function(){
+    var n = document.documentElement.getAttribute('data-theme')==='light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', n);
+    try{ localStorage.setItem(K, n); }catch(e){}
+    label();
+  };
+  document.addEventListener('DOMContentLoaded', label);
+})();
+</script>
 <style>
-:root{color-scheme:dark}
+:root{
+  --bg:#14161a; --card:#1a1d23; --input:#1d2026; --line:#262a31; --line2:#2e333c;
+  --fg:#e8eaed; --fg2:#8b94a3; --fg3:#7c8797; --fg4:#5f6a7a;
+  --accent:#2f6fed; --accent-h:#4280f5; --link:#7fb0ff; --on-accent:#fff;
+  --bd-bg:#243447; --bd-fg:#7fb0ff;
+  --l3-bg:#1e3d2b; --l3-fg:#6fdc9a; --l1-bg:#3a3320; --l1-fg:#e8c46a;
+  --bn1:#1d2a44; --bn2:#1a1d23; --bn-line:#2b4468;
+  --star:#e8c46a; --shadow:none; --hdr:rgba(20,22,26,.93);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f5f6f8; --card:#fff; --input:#fff; --line:#e4e7ec; --line2:#d0d5dd;
+  --fg:#101828; --fg2:#667085; --fg3:#667085; --fg4:#98a2b3;
+  --accent:#2f6fed; --accent-h:#1d5fd8; --link:#1a5fd6; --on-accent:#fff;
+  --bd-bg:#e8f0fe; --bd-fg:#1a5fd6;
+  --l3-bg:#dcfce7; --l3-fg:#15803d; --l1-bg:#fef3c7; --l1-fg:#a16207;
+  --bn1:#e8f0fe; --bn2:#fff; --bn-line:#c7d9f8;
+  --star:#d97706; --shadow:0 1px 2px rgba(16,24,40,.06); --hdr:rgba(245,246,248,.93);
+  color-scheme:light;
+}
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.55 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;
-     background:#14161a;color:#e8eaed}
-header{padding:22px 24px 14px;border-bottom:1px solid #262a31;position:sticky;top:0;
-       background:#14161aee;backdrop-filter:blur(12px);z-index:5}
-h1{margin:0 0 12px;font-size:17px;font-weight:600;letter-spacing:.3px}
-h1 span{color:#7c8797;font-weight:400;font-size:13px;margin-left:8px}
+     background:var(--bg);color:var(--fg);transition:background .18s,color .18s}
+header{padding:20px 24px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;
+       background:var(--hdr);backdrop-filter:blur(12px);z-index:5}
+.hrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.3px}
+h1 span{color:var(--fg3);font-weight:400;font-size:13px;margin-left:8px}
+button.theme{background:var(--card);color:var(--fg);border:1px solid var(--line2);
+  width:38px;height:38px;border-radius:10px;font-size:17px;line-height:1;cursor:pointer;
+  padding:0;flex:0 0 auto;transition:border-color .15s,background .15s}
+button.theme:hover{border-color:var(--accent);background:var(--card)}
 form{display:flex;gap:8px;flex-wrap:wrap}
-input[type=search],select{background:#1d2026;border:1px solid #2e333c;color:#e8eaed;
+input[type=search],select{background:var(--input);border:1px solid var(--line2);color:var(--fg);
   padding:9px 12px;border-radius:9px;font-size:14px;outline:none}
 input[type=search]{flex:1;min-width:220px}
-input[type=search]:focus,select:focus{border-color:#4c8dff}
-button{background:#2f6fed;color:#fff;border:0;padding:9px 18px;border-radius:9px;
-  font-size:14px;font-weight:600;cursor:pointer}
-button:hover{background:#4280f5}
+input[type=search]:focus,select:focus{border-color:var(--accent)}
+button.go{background:var(--accent);color:var(--on-accent);border:0;padding:9px 18px;
+  border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}
+button.go:hover{background:var(--accent-h)}
 main{padding:18px 24px 60px}
-.hint{color:#7c8797;font-size:13px;padding:8px 0}
+.hint{color:var(--fg3);font-size:13px;padding:8px 0}
+.hint a{color:var(--link)}
+
+/* 普通检索结果 */
 .row{display:flex;gap:14px;align-items:flex-start;padding:13px 15px;margin-bottom:8px;
-  background:#1a1d23;border:1px solid #262a31;border-radius:11px}
-.row:hover{border-color:#39414d}
+  background:var(--card);border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow)}
+.row:hover{border-color:var(--line2)}
 .badge{flex:0 0 auto;font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;
-  background:#243447;color:#7fb0ff;min-width:44px;text-align:center}
-.badge.l3{background:#1e3d2b;color:#6fdc9a}
-.badge.l2{background:#243447;color:#7fb0ff}
-.badge.l1{background:#3a3320;color:#e8c46a}
+  background:var(--bd-bg);color:var(--bd-fg);min-width:44px;text-align:center}
+.badge.l3{background:var(--l3-bg);color:var(--l3-fg)}
+.badge.l2{background:var(--bd-bg);color:var(--bd-fg)}
+.badge.l1{background:var(--l1-bg);color:var(--l1-fg)}
 .meta{flex:1;min-width:0}
 .title{font-weight:600;margin-bottom:2px}
-.title em{font-style:normal;color:#8b94a3;font-weight:400;margin-left:8px;font-size:13px}
-.path{color:#77808f;font-size:12.5px;font-family:ui-monospace,Menlo,monospace;
+.title em{font-style:normal;color:var(--fg2);font-weight:400;margin-left:8px;font-size:13px}
+.path{color:var(--fg3);font-size:12.5px;font-family:ui-monospace,Menlo,monospace;
   word-break:break-all;margin-top:3px}
-.why{color:#5f6a7a;font-size:12px;margin-top:4px}
+.why{color:var(--fg4);font-size:12px;margin-top:4px}
 .act{flex:0 0 auto;display:flex;gap:6px;align-items:center}
-a.dl{text-decoration:none;background:#2f6fed;color:#fff;padding:7px 14px;border-radius:8px;
-  font-size:13px;font-weight:600;white-space:nowrap}
-a.dl:hover{background:#4280f5}
-a.dl.alt{background:#262a31;color:#c3cad6}
-a.dl.alt:hover{background:#323844}
-.banner{display:flex;gap:14px;align-items:center;justify-content:space-between;
+a.dl{text-decoration:none;background:var(--accent);color:var(--on-accent);padding:7px 14px;
+  border-radius:8px;font-size:13px;font-weight:600;white-space:nowrap}
+a.dl:hover{background:var(--accent-h)}
+a.dl.alt{background:var(--input);color:var(--fg2);border:1px solid var(--line2)}
+a.dl.alt:hover{background:var(--card);color:var(--fg)}
+
+/* 整季视图 */
+.banner{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;
   padding:14px 16px;margin-bottom:14px;border-radius:11px;
-  background:linear-gradient(100deg,#1d2a44,#1a1d23);border:1px solid #2b4468}
+  background:linear-gradient(100deg,var(--bn1),var(--bn2));border:1px solid var(--bn-line)}
 .banner b{font-size:15px}
-.banner small{display:block;color:#8b94a3;margin-top:3px;font-weight:400}
-a.pack{text-decoration:none;background:#2f6fed;color:#fff;padding:9px 18px;border-radius:9px;
-  font-size:14px;font-weight:700;white-space:nowrap}
-a.pack:hover{background:#4280f5}
-.ep{display:flex;gap:12px;align-items:center;padding:11px 15px;margin-bottom:7px;
-  background:#1a1d23;border:1px solid #262a31;border-radius:10px}
-.ep .no{font-weight:700;color:#7fb0ff;min-width:62px;font-family:ui-monospace,Menlo,monospace}
+.banner small{display:block;color:var(--fg2);margin-top:3px;font-weight:400}
+.banner .acts{display:flex;gap:8px;flex-wrap:wrap}
+a.pack{text-decoration:none;background:var(--accent);color:var(--on-accent);padding:9px 18px;
+  border-radius:9px;font-size:14px;font-weight:700;white-space:nowrap}
+a.pack:hover{background:var(--accent-h)}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px;
+  font-size:13px;color:var(--fg3)}
+.toolbar a{color:var(--link);text-decoration:none}
+.toolbar a:hover{text-decoration:underline}
+
+.epblock{margin-bottom:14px;border:1px solid var(--line);border-radius:11px;
+  background:var(--card);overflow:hidden;box-shadow:var(--shadow)}
+.ephead{display:flex;gap:10px;align-items:center;padding:10px 14px;
+  background:var(--input);border-bottom:1px solid var(--line)}
+.ephead .no{font-weight:700;color:var(--link);font-family:ui-monospace,Menlo,monospace;
+  font-size:14px;min-width:64px}
+.ephead .cnt{color:var(--fg3);font-size:12.5px;flex:1}
+.ver{display:flex;gap:10px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line);
+  font-size:13px}
+.ver:last-child{border-bottom:0}
+.ver:hover{background:var(--input)}
+.ver.best{background:linear-gradient(90deg,var(--bn1),transparent 60%)}
+.ver .star{color:var(--star);flex:0 0 auto;width:14px;text-align:center;font-size:12px}
+.ver .vpath{flex:1;min-width:0;color:var(--fg2);font-family:ui-monospace,Menlo,monospace;
+  font-size:12.5px;word-break:break-all}
+.ver .vsize{color:var(--fg4);font-size:12px;white-space:nowrap;flex:0 0 auto}
+.ver .badge{min-width:40px;font-size:11.5px;padding:2px 6px}
+.ver .act a.dl{padding:5px 11px;font-size:12.5px}
+
+/* 分页 */
+.pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:center;
+  padding:18px 0 6px}
+.pg{display:inline-block;min-width:34px;text-align:center;padding:6px 10px;border-radius:8px;
+  text-decoration:none;color:var(--fg2);background:var(--card);border:1px solid var(--line);
+  font-size:13px}
+.pg:hover{border-color:var(--accent);color:var(--fg)}
+.pg.cur{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:700}
+.pgd{color:var(--fg4);padding:0 2px}
 </style></head><body>
 <header>
-  <h1>本地语料检索 <span>__COUNT__ 条记录已索引</span></h1>
+  <div class="hrow">
+    <h1>本地语料检索 <span>__COUNT__ 条记录已索引</span></h1>
+    <button id="themebtn" class="theme" onclick="__toggleTheme()" aria-label="切换明暗主题"></button>
+  </div>
   <form method="get" action="/">
-    <input type="search" name="q" placeholder="片名 / 剧名 / 视频文件名；加季号可整季下载，例如 权力的游戏 S08"
+    <input type="search" name="q" placeholder="片名 / 文件名关键词；带季号可看整季，例如 某某剧 S08"
            value="__Q__" autofocus>
     <select name="lang">
       <option value="">语言不限</option>
@@ -1228,15 +1350,83 @@ a.pack:hover{background:#4280f5}
       <option value="cht_eng"__S4__>繁英双语</option>
       <option value="eng"__S5__>英文</option>
     </select>
-    <button type="submit">搜索</button>
+    <button class="go" type="submit">搜索</button>
   </form>
 </header><main>__BODY__</main></body></html>"""
 
-    def render(q, lang, rows, note="", empty_hint=True):
+    # ------------------------------------------------------------------
+    def _page_bar(base, page, pages):
+        """底部分页条。base 是除 page 外的查询参数字典。"""
+        if pages <= 1:
+            return ""
+
+        def link(p, label, cls=""):
+            d = dict(base)
+            d["page"] = p
+            c = f' class="pg {cls}"' if cls else ' class="pg"'
+            return f'<a{c} href="/?{urllib.parse.urlencode(d)}">{label}</a>'
+
+        out = ['<div class="pager">']
+        if page > 1:
+            out.append(link(page - 1, "‹ 上一页"))
+        lo, hi = max(1, page - 2), min(pages, page + 2)
+        if lo > 1:
+            out.append(link(1, "1"))
+            if lo > 2:
+                out.append('<span class="pgd">…</span>')
+        for p in range(lo, hi + 1):
+            out.append(f'<span class="pg cur">{p}</span>' if p == page else link(p, str(p)))
+        if hi < pages:
+            if hi < pages - 1:
+                out.append('<span class="pgd">…</span>')
+            out.append(link(pages, str(pages)))
+        if page < pages:
+            out.append(link(page + 1, "下一页 ›"))
+        out.append("</div>")
+        return "".join(out)
+
+    def _shell(q, lang, body, theme=None):
+        page = PAGE
+        page = page.replace("__THEME__",
+                            f' data-theme="{theme}"' if theme in ("light", "dark") else "")
+        page = page.replace("__COUNT__", "{:,}".format(state["n"]))
+        page = page.replace("__Q__", html.escape(q or ""))
+        for i, v in enumerate(["chs", "chs_eng", "cht", "cht_eng", "eng"], 1):
+            page = page.replace(f"__S{i}__", " selected" if lang == v else "")
+        page = page.replace("__BODY__", "".join(body))
+        return page.encode("utf-8")
+
+    def _ver_row(c, season=None, ep=None):
+        """整季视图里的「一个版本」行。"""
+        tag = LANG_LABEL.get(c["lang"], c["lang"] or "?")
+        qs = urllib.parse.urlencode({"fp": c["fullpath"], "ip": c["inner_path"]})
+        size = f'{c["size"]:,} B' if (c["size"] or 0) > 0 else "—"
+        name = c["inner_path"].rsplit("/", 1)[-1]
+        best = ' best' if c.get("_best") else ''
+        star = '★' if c.get("_best") else ''
+        return (f'<div class="ver{best}"><span class="star">{star}</span>'
+                f'<span class="badge l{int(c["_level"])}">{tag}</span>'
+                f'<span class="vpath" title="{html.escape(c["inner_path"])}">'
+                f'{html.escape(name)}</span>'
+                f'<span class="vsize">{size}</span>'
+                f'<span class="act"><a class="dl" href="/get?{qs}&amp;conv=1">下载</a></span></div>')
+
+    # ------------------------------------------------------------------
+    def render(q, lang, rows, note="", empty_hint=True, page=1, per=SEARCH_PER,
+               theme=None):
+        total = len(rows)
+        pages = max(1, (total + per - 1) // per)
+        page = min(max(1, page), pages)
+        chunk = rows[(page - 1) * per: page * per]
+
         body = []
         if note:
             body.append(f'<div class="hint">{note}</div>')
-        for r in rows:
+        if total > per:
+            body.append(f'<div class="hint">共 <b>{total}</b> 条结果 · '
+                        f'第 {page}/{pages} 页</div>')
+
+        for r in chunk:
             lvl = int(r["_level"])
             tag = LANG_LABEL.get(r["lang"], r["lang"] or "?")
             qs = urllib.parse.urlencode({"fp": r["fullpath"], "ip": r["inner_path"]})
@@ -1250,53 +1440,86 @@ a.pack:hover{background:#4280f5}
                 f'{size} · {r["ext"]}</div></div>'
                 f'<div class="act"><a class="dl" href="/get?{qs}">下载</a>'
                 f'<a class="dl alt" href="/get?{qs}&amp;conv=1">转UTF-8</a></div></div>')
-        if not rows and not note and empty_hint:
-            body.append('<div class="hint">没有结果。试试只输入片名，或换用英文名。</div>')
-        page = PAGE
-        page = page.replace("__COUNT__", "{:,}".format(state["n"]))
-        page = page.replace("__Q__", html.escape(q or ""))
-        for i, v in enumerate(["chs", "chs_eng", "cht", "cht_eng", "eng"], 1):
-            page = page.replace(f"__S{i}__", " selected" if lang == v else "")
-        page = page.replace("__BODY__", "".join(body))
-        return page.encode("utf-8")
 
-    def render_season(q, lang, video, season, groups):
-        """整季视图：按集列出最佳字幕 + 一键打包下载。"""
-        body = []
+        if not chunk and not note and empty_hint:
+            body.append('<div class="hint">没有结果。试试只输入片名，或换用英文名。</div>')
+
+        if pages > 1:
+            body.append(_page_bar({"q": q, "lang": lang}, page, pages))
+        return _shell(q, lang, body, theme)
+
+    # ------------------------------------------------------------------
+    def render_season(q, lang, video, season, groups, page=1, per=SEASON_PER,
+                      show_all=True, theme=None):
+        """整季视图：每集列出**全部版本**，按集分页。"""
         pairs = groups[0]["pairs"]
-        zq = urllib.parse.urlencode({"q": groups[0]["series_key"] or q,
-                                     "season": season, "lang": lang})
         label = groups[0]["label"]
+        series_q = groups[0]["series_key"] or q
+
+        n_ver = sum(len(c) for _e, c in pairs)
         total_size = sum((c[0]["size"] or 0) for _e, c in pairs)
+
+        pages = max(1, (len(pairs) + per - 1) // per)
+        page = min(max(1, page), pages)
+        chunk = pairs[(page - 1) * per: page * per]
+
+        body = []
+        base = {"q": series_q, "season": season, "lang": lang, "all": 1 if show_all else 0,
+                "per": per}
+        zq = urllib.parse.urlencode({"q": series_q, "season": season, "lang": lang})
         body.append(
             f'<div class="banner"><div><b>《{html.escape(label)}》第 {season} 季 —— '
-            f'{len(pairs)} 集有字幕</b><small>每集自动挑最优一条（优先简英双语 / 简体）。'
-            f'合计约 {total_size/1e6:.1f} MB</small></div>'
-            f'<a class="pack" href="/season.zip?{zq}">⬇︎ 打包下载整季</a></div>')
-        for ep, cands in pairs:
-            b = cands[0]
-            tag = LANG_LABEL.get(b["lang"], b["lang"] or "?")
-            qs = urllib.parse.urlencode({"fp": b["fullpath"], "ip": b["inner_path"]})
+            f'{len(pairs)} 集 / {n_ver} 个版本</b>'
+            f'<small>默认列出每集全部版本，★ 是推荐的那条；合计约 {total_size / 1e6:.1f} MB'
+            f'（仅推荐版）</small></div>'
+            f'<div class="acts"><a class="pack" href="/season.zip?{zq}">'
+            f'⬇︎ 打包整季（每集推荐版）</a>'
+            f'<a class="pack" style="background:var(--input);color:var(--fg2);'
+            f'border:1px solid var(--line2)" href="/season.zip?{zq}&amp;all=1">'
+            f'打包全部版本</a></div></div>')
+
+        flip = dict(base)
+        flip["all"] = 0 if show_all else 1
+        flip["page"] = 1
+        other = "只显示每集推荐版" if show_all else f"显示全部 {n_ver} 个版本"
+        body.append(
+            f'<div class="toolbar"><span>第 {page}/{pages} 页 · 每页 {per} 集</span>'
+            f'<a href="/?{urllib.parse.urlencode(flip)}">{other}</a>'
+            f'<a href="/?{urllib.parse.urlencode({**base, "per": 4, "page": 1})}">4 集/页</a>'
+            f'<a href="/?{urllib.parse.urlencode({**base, "per": 8, "page": 1})}">8 集/页</a>'
+            f'<a href="/?{urllib.parse.urlencode({**base, "per": 16, "page": 1})}">16 集/页</a>'
+            f'</div>')
+
+        for ep, cands in chunk:
+            shown = cands if show_all else cands[:1]
+            for i, c in enumerate(shown):
+                c["_best"] = (i == 0)
+            rows = "".join(_ver_row(c) for c in shown)
             body.append(
-                f'<div class="ep"><div class="no">S{season:02d}E{ep:02d}</div>'
-                f'<div class="badge l{int(b["_level"])}">{tag}</div>'
-                f'<div class="meta"><div class="path">{html.escape(b["inner_path"])}</div>'
-                f'<div class="why">{len(cands)} 个候选 · {html.escape(b["_why"])}</div></div>'
-                f'<div class="act"><a class="dl" href="/get?{qs}&amp;conv=1">下载</a></div></div>')
+                f'<div class="epblock"><div class="ephead">'
+                f'<span class="no">S{season:02d}E{ep:02d}</span>'
+                f'<span class="cnt">共 {len(cands)} 个版本'
+                + (f'，显示前 1 个' if not show_all and len(cands) > 1 else '')
+                + f' · 推荐：{LANG_LABEL.get(cands[0]["lang"], "?")}'
+                  f' · {html.escape(cands[0]["inner_path"].rsplit("/", 1)[-1][:60])}'
+                f'</span></div>{rows}</div>')
+
+        body.append(_page_bar(base, page, pages))
+
         if len(groups) > 1:
             alts = []
             for o in groups[1:6]:
                 aq = urllib.parse.urlencode({"q": o["series_key"], "season": season,
                                              "lang": lang})
-                alts.append(f'<a class="dl alt" href="/?{aq}">《{html.escape(o["label"])}》'
+                alts.append(f'<a class="pg" href="/?{aq}">《{html.escape(o["label"])}》'
                             f' {len(o["pairs"])} 集</a>')
             body.append(
                 f'<div class="hint" style="margin-top:18px">⚠️ 「{html.escape(q)}」'
-                f'还匹配到 {len(groups)-1} 个相近的剧集分组，可能不是同一部剧；'
+                f'还匹配到 {len(groups) - 1} 个相近的剧集分组，可能不是同一部剧；'
                 f'点开看看：<br>{" ".join(alts)}</div>')
-        return render(q, lang, [], "", empty_hint=False).replace(
-            b"<main>", b"<main>" + "".join(body).encode("utf-8"), 1)
+        return _shell(q, lang, body, theme)
 
+    # ------------------------------------------------------------------
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -1312,6 +1535,12 @@ a.pack:hover{background:#4280f5}
             self.end_headers()
             self.wfile.write(data)
 
+        def _int(self, qs, key, default=1):
+            try:
+                return max(1, int(qs.get(key, [""])[0]))
+            except (ValueError, TypeError):
+                return default
+
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(u.query)
@@ -1320,14 +1549,16 @@ a.pack:hover{background:#4280f5}
                 q = (qs.get("q", [""])[0] or "").strip()
                 lang = qs.get("lang", [""])[0]
                 season = qs.get("season", [""])[0]
+                allv = qs.get("all", ["0"])[0] == "1"
                 if not q or not season.isdigit():
                     self.send_error(400, "missing q/season")
                     return
                 v = parse_video_name(q)
                 pref = {lang} if lang else None
-                data, manifest = build_season_zip(state["con"], v, int(season), pref)
+                data, manifest = build_season_zip(state["con"], v, int(season), pref,
+                                                  variants=allv)
                 if not data:
-                    self.send_error(404, "no subtitles for this season")
+                    self.send_error(404, "no files for this season")
                     return
                 self._send(data, "application/zip", f"S{int(season):02d}.zip")
                 return
@@ -1359,27 +1590,37 @@ a.pack:hover{background:#4280f5}
 
             q = (qs.get("q", [""])[0] or "").strip()
             lang = qs.get("lang", [""])[0]
+            theme = (qs.get("theme", [""])[0] or "").strip().lower() or None
+            if theme not in ("light", "dark"):
+                theme = None
             if not q:
-                self._send(render("", lang, [], ""), "text/html; charset=utf-8")
+                self._send(_shell("", lang, [], theme), "text/html; charset=utf-8")
                 return
 
             v = parse_video_name(q)
             pref = {lang} if lang else None
+            page = self._int(qs, "page", 1)
 
             # 整季模式：查询里带季、不带集
             if v["season_only"]:
                 groups = season_groups(state["con"], v, v["season"], pref)
                 if groups:
-                    self._send(render_season(q, lang, v, v["season"], groups),
+                    show_all = qs.get("all", ["1"])[0] != "0"
+                    per = self._int(qs, "per", SEASON_PER)
+                    per = min(per, 60)
+                    self._send(render_season(q, lang, v, v["season"], groups,
+                                             page=page, per=per, show_all=show_all,
+                                             theme=theme),
                                "text/html; charset=utf-8")
                     return
                 note = (f"解析：“{html.escape(q)}” → 第 {v['season']} 季，"
-                        f"但没有找到整季字幕，下面按片名列出全部结果")
-                rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)[:120]
-                self._send(render(q, lang, rows, note), "text/html; charset=utf-8")
+                        f"但没有找到整季记录，下面按名字列出全部结果")
+                rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)
+                self._send(render(q, lang, rows, note, page=page, theme=theme),
+                           "text/html; charset=utf-8")
                 return
 
-            rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)[:120]
+            rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)
             ep_txt = ""
             if v["season"] is not None:
                 ep_txt = f" S{v['season']:02d}E{(v['episode'] or 0):02d}"
@@ -1388,9 +1629,9 @@ a.pack:hover{background:#4280f5}
             if v["season"] is not None:
                 zq = urllib.parse.urlencode({"q": v["series_key"] or q,
                                              "season": v["season"], "lang": lang})
-                note += (f' · <a style="color:#7fb0ff" href="/?{zq}">'
-                         f'查看第 {v["season"]} 季整季 →</a>')
-            self._send(render(q, lang, rows, note), "text/html; charset=utf-8")
+                note += (f' · <a href="/?{zq}">查看第 {v["season"]} 季整季 →</a>')
+            self._send(render(q, lang, rows, note, page=page, theme=theme),
+                       "text/html; charset=utf-8")
 
     state["n"] = con.execute("SELECT count(*) FROM subs").fetchone()[0]
     srv = ThreadingHTTPServer((args.host, args.port), H)
