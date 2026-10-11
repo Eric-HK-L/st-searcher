@@ -368,6 +368,41 @@ def _bsdtar_names(path: str):
     return rows or None
 
 
+def service_running():
+    """服务是否在运行。返回 pid 或 None。
+
+    重建类命令会重建整张表，而服务端持有长连接；
+    并发之下读连接会看到被换掉的页，报 "database disk image is malformed"。
+    """
+    try:
+        from config import RUN_DIR
+        f = RUN_DIR / "server.pid"
+        if not f.exists():
+            return None
+        info = json.loads(f.read_text(encoding="utf-8"))
+        pid = int(info.get("pid") or 0)
+        if pid <= 0:
+            return None
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def require_service_stopped(force=False):
+    """重建类命令的前置检查。服务在跑就拒绝（除非 force）。"""
+    if force:
+        return True
+    pid = service_running()
+    if pid:
+        print(f"❌ 检索服务正在运行（pid={pid}）。")
+        print("   重建索引会重建整张表，与服务端的长连接并发时会读出坏页，")
+        print("   之后再启动服务就会一直报 database disk image is malformed。")
+        print("   请先执行 ./stop.sh，重建完再 ./start.sh。")
+        return False
+    return True
+
+
 def _list_with_bsdtar(blob: bytes, suffix: str):
     """rar / 7z 等交给 libarchive(bsdtar) 读取目录，带回每个文件的大小。"""
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -791,6 +826,10 @@ def main():
     p.add_argument("--dry-run", action="store_true")
 
     a = ap.parse_args()
+    if a.cmd in ("build-meta", "scan-inner") and not require_service_stopped(
+            getattr(a, "force", False)):
+        return 1
+
     if a.cmd == "build-meta":
         build_meta(Path(a.db), a.csv)
     elif a.cmd == "scan-inner":

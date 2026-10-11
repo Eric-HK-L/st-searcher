@@ -458,6 +458,25 @@ rm -rf storage
 
 ---
 
+## 运维须知
+
+**重建索引前必须先停止服务。**
+
+```bash
+./stop.sh
+./start.sh --build-index      # 或 ./run.sh match build-subs
+```
+
+服务与重建命令会同时访问同一个 SQLite 库。重建会 DROP 并重写整张表，
+服务端持有长连接，并发之下会读到被替换的页，报
+`database disk image is malformed`，此后所有检索都会失败。
+`build-subs`、`build-meta`、`scan-inner` 已内置检查：服务在运行时会直接拒绝执行。
+
+> 若已出现上述症状：停止服务后执行一次 `PRAGMA wal_checkpoint(TRUNCATE)`，
+> 再启动即可恢复（数据本身未损坏）。
+
+---
+
 ## 已知限制
 
 - **季集号依据文件名推断**，少数命名不规范的记录无法解析。

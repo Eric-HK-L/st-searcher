@@ -345,6 +345,49 @@ def t_nav(base="http://127.0.0.1:8777"):
         check("webui/顶栏标题回首页", False, str(e))
 
 
+# ---------------------------------------------------------------- 3c. 健康
+def t_health(base="http://127.0.0.1:8777"):
+    """这次真的挂过一次：重建索引时服务开着，WAL 涨到跟库一样大（534 MB），
+    之后所有检索都返回不了内容。这里守住几条底线。
+    """
+    from config import DB_PATH as _DB, RUN_DIR
+    idx = Path(_DB).parent
+
+    # 1) WAL 不能失控
+    wal = Path(str(_DB) + "-wal")
+    mb = wal.stat().st_size / 1e6 if wal.exists() else 0.0
+    check("health/WAL 未失控", mb < 50, f"-wal 有 {mb:.0f} MB，可能有并发重建")
+
+    # 2) 服务在跑时，重建类命令必须拒绝
+    pidf = RUN_DIR / "server.pid"
+    if not pidf.exists():
+        check("health/重建保护", False, "服务未运行，无法验证")
+    else:
+        import subprocess
+        bad = []
+        for args in (["match", "build-subs"], ["index", "scan-inner"]):
+            r = subprocess.run([str(ROOT / "run.sh")] + args, capture_output=True,
+                               text=True, timeout=120)
+            if "正在运行" not in (r.stdout + r.stderr):
+                bad.append(" ".join(args))
+        check("health/重建保护（服务在跑时拒绝）", not bad, f"未拒绝: {bad}")
+
+    # 3) 只读命令不受影响
+    import subprocess
+    r = subprocess.run([str(ROOT / "run.sh"), "index", "stats"],
+                       capture_output=True, text=True, timeout=120)
+    check("health/只读命令可用", r.returncode == 0 and "data" in r.stdout)
+
+    # 4) 检索必须真的返回内容，而不只是 200
+    try:
+        with urllib.request.urlopen(base + "/?q=black.mirror", timeout=90) as resp:
+            body = resp.read().decode("utf-8")
+        ok = resp.status == 200 and "季" in body and "<main>" in body
+        check("health/检索真的出结果", ok, f"HTTP {resp.status}, 长度 {len(body)}")
+    except Exception as e:
+        check("health/检索真的出结果", False, f"{type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------- 4. units
 def t_units():
     from searcher import (parse_special, parse_episode, fmt_size, season_title,
@@ -397,7 +440,7 @@ def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     groups = {"groundtruth": t_groundtruth, "search": t_search,
               "webui": t_webui, "recommend": t_recommend, "nav": t_nav,
-              "units": t_units}
+              "health": t_health, "units": t_units}
     print("=" * 68)
     for name, fn in groups.items():
         if which not in ("all", name):

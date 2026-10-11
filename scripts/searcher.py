@@ -421,6 +421,39 @@ CREATE INDEX IF NOT EXISTS ix_subs_rkey  ON subs(release_key);
 """
 
 
+def service_running():
+    """服务是否在运行。返回 pid 或 None。
+
+    重建索引会 DROP / 重建整张表，而服务端持有长连接；
+    并发之下读连接会看到被换掉的页，报 "database disk image is malformed"。
+    所以重建前必须先停服务。
+    """
+    try:
+        from config import RUN_DIR
+        f = RUN_DIR / "server.pid"
+        if not f.exists():
+            return None
+        info = json.loads(f.read_text(encoding="utf-8"))
+        pid = int(info.get("pid") or 0)
+        if pid <= 0:
+            return None
+        os.kill(pid, 0)               # 只探测存活，不发信号
+        return pid
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def require_service_stopped():
+    """重建类命令的前置检查。服务在跑就拒绝执行。"""
+    pid = service_running()
+    if pid:
+        print(f"❌ 检索服务正在运行（pid={pid}）。")
+        print("   重建索引会重建整张表，与服务端的长连接并发时会读出坏页。")
+        print("   请先执行 ./stop.sh，重建完再 ./start.sh。")
+        return False
+    return True
+
+
 def build_subs(db_path=DB_PATH, verbose=True):
     """把 inner_files 与单文件归档整理成统一的匹配表。"""
     con = sqlite3.connect(db_path)
@@ -540,6 +573,13 @@ def build_subs(db_path=DB_PATH, verbose=True):
         WHERE rowid IN (SELECT rid FROM t)
     """)
     con.commit()
+
+    # 重建会往 WAL 里写掉整张表的数据量（实测 WAL 能涨到和库一样大，
+    # 534 MB）。这里收一下，不然每次重建都留一个巨大的 -wal 文件。
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
 
     # 中文名不复制到 subs：archives.fullpath 是主键，查询时 JOIN 即可，
     # 省掉 ~120MB 冗余。这里只补一个大小写不敏感的中文检索辅助索引。
@@ -2495,10 +2535,33 @@ h1 a:hover{color:var(--link)}
                 self._route()
             except sqlite3.Error as e:
                 # 典型场景：一边重建索引一边开着服务。SQLite 读到被换掉的页会报
-                # "database disk image is malformed"。别丢一堆栈，给一句人话。
-                self.send_error(503, f"索引暂时不可用（{e}）。"
-                                     "如果刚在重建索引，等它跑完再刷新。")
+                # "database disk image is malformed"。
+                # 注意不能用 send_error() —— 它把 reason 塞进 HTTP 状态行，
+                # 而状态行只能放 latin-1，中文会抛 UnicodeEncodeError，
+                # 结果连错误响应都发不出去，客户端只看到连接被断开。
+                self._fail(503, "索引暂时不可用", str(e),
+                           "如果刚在重建索引，等它跑完再刷新。"
+                           "重建前建议先执行 ./stop.sh。")
             except BrokenPipeError:
+                pass
+
+        def _fail(self, code, title, detail="", hint=""):
+            """自己拼一个 UTF-8 的错误页，不走 send_error（状态行放不下中文）。"""
+            try:
+                body = (f'<!doctype html><html lang="zh"><meta charset="utf-8">'
+                        f'<title>{code}</title>'
+                        f'<body style="font:15px/1.6 -apple-system,sans-serif;'
+                        f'padding:40px;max-width:640px;margin:auto">'
+                        f'<h2>{html.escape(title)}</h2>'
+                        f'<p style="color:#888">{html.escape(detail)}</p>'
+                        f'<p>{html.escape(hint)}</p></body>')
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
                 pass
 
         def _route(self):
@@ -2688,6 +2751,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("build-subs", help="建立匹配索引（约 1 分钟）")
+    p.add_argument("--force", action="store_true", help="服务在跑也强行重建（不推荐）")
     p.add_argument("--db", default=str(DB_PATH))
 
     p = sub.add_parser("find", help="给一个视频文件/名字找字幕")
@@ -2723,6 +2787,8 @@ def main():
 
     a = ap.parse_args()
     if a.cmd == "build-subs":
+        if not getattr(a, "force", False) and not require_service_stopped():
+            return 1
         build_subs(a.db)
     elif a.cmd == "find":
         sys.exit(cmd_find(a))
