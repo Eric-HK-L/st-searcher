@@ -26,6 +26,7 @@ shift || true
 
 case "$tool" in
   match)  exec "$PY" "$DIR/scripts/searcher.py" "$@" ;;
+  test)   exec "$PY" "$DIR/tests/test_all.py" "$@" ;;
   index)  exec "$PY" "$DIR/scripts/indexer.py" "$@" ;;
   daemon) exec "$PY" "$DIR/scripts/daemon.py" "$@" ;;
   status) exec "$PY" "$DIR/scripts/daemon.py" status ;;
@@ -41,5 +42,5 @@ case "$tool" in
 解释器: $PY
 EOF
     ;;
-  *) echo "未知工具: $tool（可用: match / index / status）" >&2; exit 2 ;;
+  *) echo "未知工具: $tool（可用: match / index / test / status）" >&2; exit 2 ;;
 esac

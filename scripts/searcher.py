@@ -218,8 +218,10 @@ def classify_lang(marks):
 
 # 「特别篇」的写法。要求关键词是独立 token（前后是分隔符/行尾/紧跟数字），
 # 否则 NOVA、SPecial Edition 之类会被误伤。
+# 关键词前**必须**有分隔符（不能是文件名开头）：
+# "Special.Forces.2011" 是一部电影的名字，不是特别篇。
 _SP_TOKEN_RE = re.compile(
-    r"(?:^|[.\s_\[(-])(special|sp|ova|oad|特典|特别篇|特別篇|番外篇|番外|剧场版|劇場版)"
+    r"(?:[.\s_\[(-])(special|sp|ova|oad|特典|特别篇|特別篇|番外篇|番外|剧场版|劇場版)"
     r"(?=[.\s_\])-]|$|\d)", re.I)
 
 # "Special Edition" / "特别版" 是版本说明，不是特别篇
@@ -439,7 +441,14 @@ def build_subs(db_path=DB_PATH, verbose=True):
         head = base
         sp_key = ""
         m = _EP_RE.search(base)
-        if m:
+        if m and episode == 0:
+            # S01E00：发行方用「第 0 集」放圣诞特辑 / 先行篇，不能算进正片集数
+            # （否则 Game of Thrones S01 会变成 11 集）。挪到第 0 季。
+            # 必须先于下面的 `if m` 判断 —— S01E00 同样能被 _EP_RE 匹配到。
+            head = base[: m.start()]
+            season = 0
+            sp_key = special_key(base, m, norm_key(head))
+        elif m:
             head = base[: m.start()]
         else:
             # 没有正常季集号：再看是不是特别篇（Skins.S01.Special / 某剧 SP / 特别篇）
@@ -944,20 +953,38 @@ _EP_IN_KEY = re.compile(r"(?:^|\.)(?:s\d{1,2}e\d{1,3}|\d{1,2}x\d{2,3}|s\d{1,2}|e
 
 
 def release_family(release_key):
-    """发布名去掉「季集号」那一段 —— 得到这一版的标识。
+    """发布名 -> 这一版的标识：**从第一个画质词开始到结尾**。
 
-    person.of.interest.s02e01.720p.web.dl.h.264.kings
-      -> person.of.interest.720p.web.dl.h.264.kings
-    同一部剧按不同画质/发布组压制的，就靠这个区分。
+    person.of.interest.s02e01.720p.web.dl.h.264.kings  -> 720p.web.dl.h.264.kings
+    sherlock.the.blind.banker.hdtv.xvid.fov            -> hdtv.xvid.fov
+    sherlock.the.great.game.hdtv.xvid.fov              -> hdtv.xvid.fov   ← 同一版
+
+    为什么要从画质词开始：老剧常常**用分集标题**命名而不是 SxxExx
+    （sherlock.the.blind.banker...）。如果只去掉季集号那一段，
+    每集的标题不同，就会被当成不同的发布版本，一季里一集都凑不齐。
+    画质词之后才是「画质 + 来源 + 发布组」这一版真正的标识。
+
+    没有画质词时退回旧办法（去掉季集号那段）。
     """
     rk = release_key or ""
+    m = _QUALITY_RE.search(rk)
+    if m:
+        return rk[m.start(1):].strip(".")
     return re.sub(r"\.+", ".", _EP_IN_KEY.sub("", rk)).strip(".")
 
 
 def release_label(inner_path):
-    """从原始文件名还原出可读的版本名（保留大小写）。"""
+    """从原始文件名还原出可读的版本名（保留大小写）。
+
+    跟 release_family 对齐：从第一个画质词开始截。
+    这样「按分集标题命名」的发布不会把标题带进版本名里
+    （Sherlock.A.Scandal.in.Belgravia.720p.HDTV.x264-FoV -> 720p.HDTV.x264-FoV）。
+    """
     stem = os.path.splitext(os.path.basename(inner_path))[0]
     base, _lang = split_lang(stem)
+    qm = _QUALITY_RE.search(base)
+    if qm:
+        return base[qm.start(1):].strip(" ._-")
     m = _EP_RE.search(base)
     if m:
         left = base[:m.start()].rstrip(" ._-")
@@ -967,11 +994,16 @@ def release_label(inner_path):
 
 
 # 画质 / 来源 / 编码标记 —— 公共前缀切到这里就该停，这些信息对用户有用
+# 画质 / 来源 / 编码标记。用「前后都是分隔符」而不是 \b ——
+# 有些发布名用下划线：belgravia.720p_hdtv_x264-fov，
+# 720p 后面紧跟的是 _（也是词字符），\b 在这里匹配不上。
 _QUALITY_RE = re.compile(
-    r"\b(?:480p|576p|720p|1080p|1080i|2160p|4k|8k|uhd|hd|sd|"
-    r"hdtv|web-?dl|web-?rip|web|bluray|blu-ray|bdrip|brrip|dvdrip|dvd|hdrip|remux|"
-    r"x264|x265|h\.?264|h\.?265|hevc|xvid|divx|avc|aac|ac3|eac3|dts|ddp|flac)\b",
-    re.I)
+    r"(?:^|[.\s_\-\[()])("
+    r"480p|576p|720p|1080p|1080i|2160p|4k|8k|uhd|hdtv|"
+    r"web-?dl|web-?rip|web|bluray|blu-?ray|bdrip|brrip|dvdrip|hdrip|dvd|remux|"
+    r"x264|x265|h\.?264|h\.?265|hevc|xvid|divx|avc|aac|ac3|eac3|dts|ddp|flac|"
+    r"hd|sd"
+    r")(?=[.\s_\-)\]]|$)", re.I)
 
 
 def season_versions(con, video, season=None, lang_pref=None):
@@ -1011,7 +1043,7 @@ def season_versions(con, video, season=None, lang_pref=None):
     pre = _common_prefix([x["label"] for x in out])
     m = _QUALITY_RE.search(pre)
     if m:
-        pre = pre[:m.start()]
+        pre = pre[:m.start(1)]
     if len(pre) >= 3:
         for x in out:
             x["short"] = x["label"][len(pre):].strip(" ._-") or x["label"]
@@ -2216,8 +2248,30 @@ a.pack:hover{background:var(--accent-h)}
                     '下载后可直接使用。点语言即开始打包下载。</div>')
 
         if not vers:
-            body.append('<div class="empty">这一季没有能覆盖多集的版本。'
-                        '可以到「分集下载」逐集取。</div>')
+            body.append('<div class="empty">这一季**没有**「同一个发布版本覆盖多集」的包<br>'
+                        '—— 每一集来自不同的发布组，凑不出统一的版本。</div>')
+            # 退路：按语言合并。明确写清每集版本可能不同，由用户自己决定要不要。
+            langs = {}
+            for _ep, cs in group["pairs"]:
+                for c in cs:
+                    langs.setdefault(c["lang"], 0)
+                    langs[c["lang"]] += 1
+            floor = min(2, len(group["pairs"]))
+            btns = []
+            for lg, n in sorted(langs.items(), key=lambda t: LANG_RANK.get(t[0], 9)):
+                if n < floor:
+                    continue
+                tag = LANG_LABEL.get(lg, lg or "未标注")
+                zq = urllib.parse.urlencode({"q": series_q, "season": season,
+                                             "lang": lg, "merge": 1})
+                btns.append(f'<a class="btn small" href="/season.zip?{zq}">'
+                            f'下载 {tag} <span class="n">{n} 个文件</span></a>')
+            if btns:
+                body.append('<div class="note" style="border-color:var(--l1-fg)">'
+                            '⚠️ 下面是**按语言合并**的整季包：每集取该语言下最先找到的一条，'
+                            '所以各集的发布版本可能不一致。要每集自己挑，请用「分集下载」。'
+                            f'<div class="langrow" style="padding:12px 0 0">{"".join(btns)}</div>'
+                            '</div>')
             return _shell(q, lang, body, theme)
 
         for i, v in enumerate(vers, 1):
@@ -2293,6 +2347,8 @@ a.pack:hover{background:var(--accent-h)}
                 season = qs.get("season", [""])[0]
                 allv = qs.get("all", ["0"])[0] == "1"
                 fam = (qs.get("family", [""])[0] or "").strip() or None
+                if qs.get("merge", ["0"])[0] == "1":
+                    fam = None
                 if not q or not season.isdigit():
                     self.send_error(400, "missing q/season")
                     return
