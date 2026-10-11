@@ -1716,6 +1716,8 @@ def build_season_zip(con, video, season, lang_pref=None, episodes=None,
         if not cands_lang:
             cands_lang = [(lg, d["n"]) for lg, d in v["langs"].items()]
         # 只挑一种语言：优先 chs_eng > chs > cht_eng > cht > eng，其次覆盖集数
+        if not cands_lang:
+            return None, []
         rank = {"chs_eng": 0, "chs": 1, "cht_eng": 2, "cht": 3, "eng": 4}
         cands_lang.sort(key=lambda t: (rank.get(t[0], 9), -t[1]))
         lg = cands_lang[0][0]
@@ -2267,7 +2269,7 @@ h1 a:hover{color:var(--link)}
         label = groups[0]["label"]
         series_q = groups[0]["series_key"] or q
         n_ver = sum(len(cs) for _e, cs in pairs)
-        total = sum((cs[0]["size"] or 0) for _e, cs in pairs)
+        total = sum((cs[0]["size"] or 0) for _e, cs in pairs if cs)
 
         pages = max(1, (len(pairs) + per - 1) // per)
         page = min(max(1, page), pages)
@@ -2544,6 +2546,16 @@ h1 a:hover{color:var(--link)}
                            "重建前建议先执行 ./stop.sh。")
             except BrokenPipeError:
                 pass
+            except Exception as e:
+                # 兜底。未捕获的异常会让 socketserver 直接掐断连接，
+                # 浏览器只显示「网页出错」，看不出发生了什么。
+                # 宁可回一个 500 页面，把异常类型和信息带上。
+                import traceback
+                traceback.print_exc()
+                self._fail(500, "检索时发生内部错误",
+                           f"{type(e).__name__}: {e}",
+                           "这属于程序缺陷。日志里有完整调用栈："
+                           "storage/logs/server.log")
 
         def _fail(self, code, title, detail="", hint=""):
             """自己拼一个 UTF-8 的错误页，不走 send_error（状态行放不下中文）。"""
@@ -2663,7 +2675,10 @@ h1 a:hover{color:var(--link)}
                                              theme=theme),
                                "text/html; charset=utf-8")
                     return
-                if len(overview[0]["seasons"]) >= 2:
+                # 注意先判 overview 非空：搜一个库里没有的剧名时
+                # series_overview 返回 []，直接取 [0] 会 IndexError，
+                # 未捕获的话连接被直接掐断，浏览器只看到「网页报错」。
+                if overview and len(overview[0]["seasons"]) >= 2:
                     self._send(render_series(q, lang, overview, theme),
                                "text/html; charset=utf-8")
                     return

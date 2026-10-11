@@ -388,6 +388,52 @@ def t_health(base="http://127.0.0.1:8777"):
         check("health/检索真的出结果", False, f"{type(e).__name__}: {e}")
 
 
+# ---------------------------------------------------------------- 3d. 健壮性
+FUZZ = [
+    "浪漫医生金师傅", "不存在的剧名asdfgh", "", " ", "  测试  ", "a", "%", "_", "'", '"',
+    "<script>", "!!!", "x" * 300, "第", "特别篇", "SP", "..", "a.b.c.d.e", "S01E01",
+    "第1季", "第一季", "\\", "&&", "null", "0", "-1", "日剧", "韩剧", "——",
+]
+
+
+def t_robust(base="http://127.0.0.1:8777"):
+    """任何输入都不能把服务搞崩。
+
+    用户搜「浪漫医生金师傅」时网页直接报错：库里没有这部剧，
+    series_overview 返回空列表，而路由里紧接着取了 overview[0]，
+    抛 IndexError。异常没被捕获，socketserver 直接掐断连接，
+    浏览器只显示「网页出错」，看不到任何原因。
+    """
+    bad = []
+    for c in FUZZ:
+        u = "/?" + urllib.parse.urlencode({"q": c})
+        try:
+            with urllib.request.urlopen(base + u, timeout=60) as r:
+                body = r.read()
+            if r.status != 200:
+                bad.append(f"{c[:16]!r} HTTP {r.status}")
+            elif b"<main>" not in body:
+                bad.append(f"{c[:16]!r} 200 但页面异常")
+        except Exception as e:
+            bad.append(f"{c[:16]!r} {type(e).__name__}")
+    check(f"robust/{len(FUZZ)} 个输入都不崩", not bad, "; ".join(bad[:4]))
+
+    # 库里确实没有的剧名：必须给出「没有结果」而不是报错
+    try:
+        u = "/?" + urllib.parse.urlencode({"q": "浪漫医生金师傅"})
+        with urllib.request.urlopen(base + u, timeout=60) as r:
+            body = r.read().decode("utf-8")
+        check("robust/查无此剧给正常空页",
+              r.status == 200 and ("没有结果" in body or "hint" in body),
+              f"HTTP {r.status}")
+    except Exception as e:
+        check("robust/查无此剧给正常空页", False, f"{type(e).__name__}: {e}")
+
+    # 内部错误也必须回一个可读页面，而不是空回复
+    check("robust/有全局异常兜底",
+          "except Exception as e:" in (ROOT / "scripts" / "searcher.py").read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------- 4. units
 def t_units():
     from searcher import (parse_special, parse_episode, fmt_size, season_title,
@@ -440,7 +486,7 @@ def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     groups = {"groundtruth": t_groundtruth, "search": t_search,
               "webui": t_webui, "recommend": t_recommend, "nav": t_nav,
-              "health": t_health, "units": t_units}
+              "health": t_health, "robust": t_robust, "units": t_units}
     print("=" * 68)
     for name, fn in groups.items():
         if which not in ("all", name):
