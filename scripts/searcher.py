@@ -1194,7 +1194,10 @@ def recommend_season(con, video, season, lang_pref=None):
         full = {lg: d for lg, d in v["langs"].items() if len(d["eps"]) == total}
         if not full:
             continue
-        # 完整的语言越多，说明这一版越齐全；同分再看文件数，最后按名字保证稳定
+        # 完整的语言越多，说明这一版越齐全；同分再看文件数，最后按名字保证稳定。
+        # 刻意不参与排序的因素：画质。字幕是文本，跟画面分辨率无关，
+        # 720p 的字幕一样能配 1080p 的片源，甚至可能质量更好
+        # （有些 720p 发布是精校过的）。所以「完整」优先于「画质」。
         key = (-len(full), -v["n_files"], v["family"])
         if best is None or key < best[0]:
             best = (key, v, full)
@@ -2365,7 +2368,10 @@ h1 a:hover{color:var(--link)}
                     f'<div class="sub">共 {n_ep} {unit} · 按发布版本整理成 '
                     f'{len(vers)} 个包</div></div>')
         body.append('<div class="note">每个整季包里，每集只放一个字幕文件，'
-                    '下载后可直接使用。点语言即开始打包下载。</div>')
+                    '下载后可直接使用。点语言即开始打包下载。'
+                    '<br><b>字幕是文本，与画面分辨率无关</b> —— 发布名里的 '
+                    '720p / 1080p 指字幕对应的片源版本，不影响能否使用；'
+                    '因此推荐以「覆盖是否完整」为准，而非画质。</div>')
 
         rec = recommend_season(state["con"], video, season)
         if rec["kind"] != "none":
