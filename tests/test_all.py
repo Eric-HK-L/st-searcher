@@ -231,6 +231,76 @@ def t_webui(base="http://127.0.0.1:8777"):
     check("webui/页面与按钮", not problems, "; ".join(problems[:4]))
 
 
+# ---------------------------------------------------------------- 3a. 推荐包
+def t_recommend(base="http://127.0.0.1:8777"):
+    """推荐整季包：有完整版本就推那个版本，都不完整就推拼出来的补全包。
+
+    要求推荐包下载下来必须**每集恰好一个文件**，且集数齐全。
+    """
+    import sqlite3
+    from searcher import parse_video_name, season_groups, recommend_season
+
+    def get(u, timeout=300):
+        with urllib.request.urlopen(base + u, timeout=timeout) as r:
+            return r.read()
+
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+
+    # 后端判定：完整版本 / 补全包，两种情形都要覆盖到
+    kinds = {}
+    cases = [("person.of.interest", 2), ("black.mirror", 3), ("sherlock", 1),
+             ("sherlock", 2), ("the.100", 2), ("downton.abbey", 6)]
+    bad = []
+    for sk, se in cases:
+        r = recommend_season(con, parse_video_name(sk), se)
+        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        if r["kind"] == "none":
+            bad.append(f"{sk} S{se} 没有推荐")
+            continue
+        if not r["langs"]:
+            bad.append(f"{sk} S{se} 推荐里没有可选语言")
+        # 推荐的每种语言都必须覆盖到它声称的集数
+        for lg, d in r["langs"].items():
+            if r["kind"] == "version" and d["n"] != r["total"]:
+                bad.append(f"{sk} S{se} 推荐版本 {lg} 只有 {d['n']}/{r['total']} 集")
+    check("recommend/后端判定", not bad, "; ".join(bad[:3]))
+    check("recommend/两种情形都覆盖到",
+          kinds.get("version", 0) > 0 and kinds.get("composed", 0) > 0, f"分布 {kinds}")
+
+    # 前端：推荐卡存在，且下载下来每集恰好一个文件
+    problems = []
+    for sk, se in (("person.of.interest", 2), ("sherlock", 1), ("the.100", 2)):
+        try:
+            page = get(f"/?q={sk}&season={se}").decode("utf-8")
+        except Exception as e:
+            problems.append(f"{sk} S{se} 取页面失败 {e}")
+            continue
+        if '<div class="reco">' not in page:
+            problems.append(f"{sk} S{se} 页面上没有推荐卡")
+            continue
+        m = re.search(r'href="(/season\.zip\?[^"]*)"', page[page.index('<div class="reco">'):])
+        if not m:
+            problems.append(f"{sk} S{se} 推荐卡里没有下载按钮")
+            continue
+        try:
+            z = get(m.group(1).replace("&amp;", "&"))
+            zf = zipfile.ZipFile(io.BytesIO(z))
+            names = zf.namelist()
+            eps = [re.search(r"(S\d+E\d+|SP\d+)", n).group(1) for n in names
+                   if re.search(r"(S\d+E\d+|SP\d+)", n)]
+            want = len(season_groups(con, parse_video_name(sk), se)[0]["pairs"])
+            if zf.testzip() is not None:
+                problems.append(f"{sk} S{se} 推荐包损坏")
+            elif len(eps) != len(set(eps)):
+                problems.append(f"{sk} S{se} 推荐包里同一集出现多次")
+            elif len(set(eps)) != want:
+                problems.append(f"{sk} S{se} 推荐包 {len(set(eps))} 集，应为 {want} 集")
+        except Exception as e:
+            problems.append(f"{sk} S{se} 推荐包下载/解包失败: {e}")
+    check("recommend/推荐包集数齐全", not problems, "; ".join(problems[:3]))
+
+
 # ---------------------------------------------------------------- 3b. 导航
 def t_nav(base="http://127.0.0.1:8777"):
     """剧集总览 -> 某一季 -> 必须能回到总览。
@@ -326,7 +396,8 @@ def t_units():
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     groups = {"groundtruth": t_groundtruth, "search": t_search,
-              "webui": t_webui, "nav": t_nav, "units": t_units}
+              "webui": t_webui, "recommend": t_recommend, "nav": t_nav,
+              "units": t_units}
     print("=" * 68)
     for name, fn in groups.items():
         if which not in ("all", name):

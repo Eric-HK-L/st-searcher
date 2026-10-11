@@ -1162,6 +1162,62 @@ def _merge_series_groups(by_series, cn_by_series):
     return list(merged.values())
 
 
+def recommend_season(con, video, season, lang_pref=None):
+    """挑一个「完整」的整季包推荐给用户。
+
+    完整 = 这一季的**每一集**都有字幕。
+
+    1) 有单一版本就完整的 —— 推荐那个版本（用户的整季通常是同一版本）。
+    2) 每个版本都不全 —— 退而推荐「每集各取一条」拼出来的补全包，
+       并在界面上写清各集版本可能不同。
+
+    返回 {"kind": "version"|"composed"|"none", "family", "label",
+          "langs": {lang: {"n","bytes","missing"}}, "total", "missing"}
+    """
+    groups = season_groups(con, video, season, lang_pref)
+    if not groups:
+        return {"kind": "none", "total": 0, "langs": {}, "missing": []}
+    pairs = groups[0]["pairs"]
+    total = len(pairs)
+    all_eps = {ep for ep, _cs in pairs}
+    if total == 0:
+        return {"kind": "none", "total": 0, "langs": {}, "missing": []}
+
+    def stat(eps_map):
+        return {"n": len(eps_map),
+                "bytes": sum((c["size"] or 0) for c in eps_map.values() if (c["size"] or 0) > 0),
+                "missing": sorted(all_eps - set(eps_map))}
+
+    # 1) 单一版本就完整
+    best = None
+    for v in season_versions(con, video, season, lang_pref):
+        full = {lg: d for lg, d in v["langs"].items() if len(d["eps"]) == total}
+        if not full:
+            continue
+        # 完整的语言越多，说明这一版越齐全；同分再看文件数，最后按名字保证稳定
+        key = (-len(full), -v["n_files"], v["family"])
+        if best is None or key < best[0]:
+            best = (key, v, full)
+    if best:
+        _k, v, full = best
+        return {"kind": "version", "family": v["family"], "label": v["short"],
+                "langs": {lg: stat(d["eps"]) for lg, d in full.items()},
+                "total": total, "missing": []}
+
+    # 2) 都不完整 -> 按语言把各版本拼起来
+    by_lang = {}
+    for ep, cands in pairs:
+        for c in cands:
+            d = by_lang.setdefault(c["lang"], {})
+            d.setdefault(ep, c)          # cands 已按得分降序
+    langs = {lg: stat(d) for lg, d in by_lang.items()}
+    covered = set()
+    for d in by_lang.values():
+        covered |= set(d)
+    return {"kind": "composed", "family": None, "label": "补全包",
+            "langs": langs, "total": total, "missing": sorted(all_eps - covered)}
+
+
 def _count_versions(pairs):
     """一季里「能覆盖多集」的发布版本数 —— 跟 season_versions 同一套判据。"""
     total = len(pairs)
@@ -1981,6 +2037,16 @@ h1 a:hover{color:var(--link)}
 .sinfo{color:var(--fg3);font-size:13px}
 .sright{display:flex;gap:8px;flex:0 0 auto}
 
+/* ---- 推荐包 ---- */
+.reco{background:linear-gradient(100deg,var(--bn1),var(--bn2));
+  border:1px solid var(--star);border-radius:11px;padding:14px 16px;margin-bottom:16px}
+.recohead{font-size:14px;font-weight:700;margin-bottom:5px}
+.recohead .star{color:var(--star);margin-right:5px}
+.recohead .ok{color:var(--l3-fg);font-weight:600;margin-left:8px}
+.recohead .bad{color:var(--l1-fg);font-weight:600;margin-left:8px}
+.reconote{color:var(--fg2);font-size:12.5px;line-height:1.6}
+.reco .langrow{padding:11px 0 0}
+
 /* ---- 整季下载：版本卡片 ---- */
 .verbox{background:var(--card);border:1px solid var(--line);border-radius:11px;
   margin-bottom:10px;overflow:hidden;box-shadow:var(--shadow)}
@@ -2300,6 +2366,44 @@ h1 a:hover{color:var(--link)}
                     f'{len(vers)} 个包</div></div>')
         body.append('<div class="note">每个整季包里，每集只放一个字幕文件，'
                     '下载后可直接使用。点语言即开始打包下载。</div>')
+
+        rec = recommend_season(state["con"], video, season)
+        if rec["kind"] != "none":
+            if rec["kind"] == "version":
+                head = (f'<span class="star">★</span>推荐整季包'
+                        f'<span class="ok">完整覆盖 {rec["total"]}/{rec["total"]} 集</span>')
+                note = (f'单一发布版 <b>{html.escape(rec["label"])}</b> 就覆盖了全部 '
+                        f'{rec["total"]} 集，整季为同一版本。')
+            else:
+                head = (f'<span class="star">★</span>推荐整季包（补全）'
+                        + (f'<span class="ok">覆盖 {rec["total"]}/{rec["total"]} 集</span>'
+                           if not rec["missing"]
+                           else f'<span class="bad">仅覆盖 '
+                                f'{rec["total"] - len(rec["missing"])}/{rec["total"]} 集</span>'))
+                note = ('没有任何单一版本覆盖全部集数，此包由多个版本拼成，'
+                        '每集各取一条，<b>各集的发布版本可能不同</b>。')
+                if rec["missing"]:
+                    note += (f'<br>以下集数所有版本都缺：'
+                             f'{"、".join("E%02d" % e for e in rec["missing"])}')
+            btns = []
+            for lg, d in sorted(rec["langs"].items(), key=lambda t: LANG_RANK.get(t[0], 9)):
+                if d["n"] < rec["total"] and rec["kind"] == "version":
+                    continue
+                tag = LANG_LABEL.get(lg, lg or "未标注")
+                q2 = {"q": series_q, "season": season, "lang": lg}
+                if rec["kind"] == "version":
+                    q2["family"] = rec["family"]
+                else:
+                    q2["merge"] = 1
+                btns.append(f'<a class="btn small" href="/season.zip?'
+                            f'{urllib.parse.urlencode(q2)}">下载 {tag} '
+                            f'<span class="n">{d["n"]} 集 · '
+                            f'{fmt_size(d["bytes"]) if d["bytes"] else "大小未知"}'
+                            f'</span></a>')
+            if btns:
+                body.append(f'<div class="reco"><div class="recohead">{head}</div>'
+                            f'<div class="reconote">{note}</div>'
+                            f'<div class="langrow">{"".join(btns)}</div></div>')
 
         if not vers:
             body.append('<div class="empty">这一季**没有**「同一个发布版本覆盖多集」的包<br>'
