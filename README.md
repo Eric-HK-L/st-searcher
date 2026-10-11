@@ -4,7 +4,7 @@
 
 **将按内容哈希命名的归档集合，构建为可按名称检索、按整季导出的本地索引**
 
-[![version](https://img.shields.io/badge/version-v0.2-blue.svg)](VERSION)
+[![version](https://img.shields.io/badge/version-v0.2.1-blue.svg)](VERSION)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.9%2B-yellow.svg)](#环境要求)
 [![deps](https://img.shields.io/badge/third--party%20deps-0-brightgreen.svg)](#依赖策略)
