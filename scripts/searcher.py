@@ -1942,6 +1942,13 @@ a.pack:hover{background:var(--accent-h)}
 .tab:hover{color:var(--fg);background:var(--input)}
 .tab.on{background:var(--card);border-color:var(--line);color:var(--fg);font-weight:600}
 
+/* ---- 面包屑 / 标题 ---- */
+.crumb{margin:0 0 12px;font-size:13px}
+.crumb a{color:var(--link);text-decoration:none}
+.crumb a:hover{text-decoration:underline}
+h1 a{color:inherit;text-decoration:none}
+h1 a:hover{color:var(--link)}
+
 /* ---- 标题区 ---- */
 .head{margin:0 0 16px}
 .head h2{margin:0;font-size:19px;font-weight:600;letter-spacing:.2px;line-height:1.3}
@@ -2029,7 +2036,7 @@ a.pack:hover{background:var(--accent-h)}
 </style></head><body>
 <header>
   <div class="hrow">
-    <h1>本地语料检索 <span>__COUNT__ 条记录已索引</span></h1>
+    <h1><a href="/" title="回到首页，清空检索">本地语料检索</a> <span>__COUNT__ 条记录已索引</span></h1>
     <button id="themebtn" class="theme" onclick="__toggleTheme()" aria-label="切换明暗主题"></button>
   </div>
   <form method="get" action="/">
@@ -2162,7 +2169,8 @@ a.pack:hover{background:var(--accent-h)}
             base["theme"] = theme
 
         unit = "个特别篇" if season == 0 else "集"
-        body = [_tabs(series_q, lang, season, "episode", theme)]
+        body = [_crumb(series_q, label, lang, theme),
+                _tabs(series_q, lang, season, "episode", theme)]
         body.append(f'<div class="head"><h2>《{html.escape(label)}》'
                     f'<span class="sep">/</span>{season_title(season)}</h2>'
                     f'<div class="sub">共 {len(pairs)} {unit} · {n_ver} 个版本 · '
@@ -2221,6 +2229,24 @@ a.pack:hover{background:var(--accent-h)}
             return f'<a class="{cls}" href="/?{urllib.parse.urlencode(d)}">{label}</a>'
         return f'<div class="tabs">{one("season", "整季下载")}{one("episode", "分集下载")}</div>'
 
+    def _crumb(series_q, label, lang, theme=None):
+        """回到「这部剧的全部季」。
+
+        只在这部剧确实不止一季（或有特别篇）时才给 —— 单季剧点了会原地打转。
+        """
+        n = state["con"].execute(
+            "SELECT count(DISTINCT season) FROM subs WHERE series_key=? OR series_key LIKE ?",
+            (series_q, series_q + ".%")).fetchone()[0]
+        if n < 2:
+            return ""
+        d = {"q": series_q}
+        if lang:
+            d["lang"] = lang
+        if theme:
+            d["theme"] = theme
+        return (f'<div class="crumb"><a href="/?{urllib.parse.urlencode(d)}">'
+                f'← 返回《{html.escape(label)}》全部季</a></div>')
+
     def render_series(q, lang, overview, theme=None):
         """剧名检索结果：按季列出，每季给「整季下载」「分集下载」两个入口。"""
         g = overview[0]
@@ -2264,7 +2290,8 @@ a.pack:hover{background:var(--accent-h)}
         if group.get("lang_pref"):
             pass
 
-        body = [_tabs(series_q, lang, season, "season", theme)]
+        body = [_crumb(series_q, group["label"], lang, theme),
+                _tabs(series_q, lang, season, "season", theme)]
         n_ep = len(group["pairs"])
         unit = "个特别篇" if season == 0 else "集"
         body.append(f'<div class="head"><h2>《{html.escape(group["label"])}》'

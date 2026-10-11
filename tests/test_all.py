@@ -231,6 +231,50 @@ def t_webui(base="http://127.0.0.1:8777"):
     check("webui/页面与按钮", not problems, "; ".join(problems[:4]))
 
 
+# ---------------------------------------------------------------- 3b. 导航
+def t_nav(base="http://127.0.0.1:8777"):
+    """剧集总览 -> 某一季 -> 必须能回到总览。
+
+    曾经季页面上只有「整季下载 / 分集下载」两个切换，点进某一季就再也回不到
+    选剧集的地方（只能按浏览器后退）。
+    """
+    def get(u, timeout=90):
+        with urllib.request.urlopen(base + u, timeout=timeout) as r:
+            return r.read().decode("utf-8")
+
+    problems = []
+    for sk in ("black.mirror", "person.of.interest", "downton.abbey"):
+        try:
+            ov = get("/?" + urllib.parse.urlencode({"q": sk}))
+        except Exception as e:
+            problems.append(f"{sk} 总览失败 {e}")
+            continue
+        if '<span class="sno">' not in ov:
+            problems.append(f"{sk} 没有进入季总览")
+            continue
+        for view in ("view=season", "view=episode"):
+            link = [x for x in re.findall(r'href="(/\?[^"]*)"', ov) if view in x]
+            if not link:
+                problems.append(f"{sk} 总览里没有 {view} 链接")
+                continue
+            page = get(link[0].replace("&amp;", "&"))
+            crumb = re.search(r'class="crumb"><a href="([^"]*)"', page)
+            if not crumb:
+                problems.append(f"{sk} 的 {view} 页面没有返回剧集的入口")
+                continue
+            back = get(crumb.group(1).replace("&amp;", "&"))
+            if back != ov:
+                problems.append(f"{sk} 的 {view} 返回后与原总览不一致")
+    check("webui/季页面能返回剧集总览", not problems, "; ".join(problems[:3]))
+
+    # 顶栏标题应能回首页
+    try:
+        h = get("/?q=black.mirror&season=3")
+        check("webui/顶栏标题回首页", bool(re.search(r'<h1><a href="/"', h)))
+    except Exception as e:
+        check("webui/顶栏标题回首页", False, str(e))
+
+
 # ---------------------------------------------------------------- 4. units
 def t_units():
     from searcher import (parse_special, parse_episode, fmt_size, season_title,
@@ -282,7 +326,7 @@ def t_units():
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     groups = {"groundtruth": t_groundtruth, "search": t_search,
-              "webui": t_webui, "units": t_units}
+              "webui": t_webui, "nav": t_nav, "units": t_units}
     print("=" * 68)
     for name, fn in groups.items():
         if which not in ("all", name):
