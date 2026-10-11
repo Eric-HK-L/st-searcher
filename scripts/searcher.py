@@ -32,10 +32,12 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -1896,16 +1898,80 @@ def cmd_find(args):
 def cmd_serve(args):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    con = sqlite3.connect(args.db, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    state = {"con": con}
+    _TL = threading.local()
+
+    def db():
+        """取当前线程自己的 sqlite 连接。
+
+        为什么必须按线程隔离：ThreadingHTTPServer 是一个请求一个线程，而
+        macOS 自带的 libsqlite3 是按 multi-thread（而不是 serialized）模式
+        编译的 —— 也就是说**同一个 Connection 被多个线程并发使用是未定义
+        行为**。实测过一次：并发几个检索请求之后，十几个线程一起卡死在
+        sqlite3VdbeExec / moveToRoot 里再也出不来，此后所有查询永久超时，
+        只能重启服务。每条连接只在自己线程里用就没有这个问题。
+        """
+        con = getattr(_TL, "con", None)
+        if con is None:
+            con = sqlite3.connect(args.db, check_same_thread=False)
+            con.row_factory = sqlite3.Row
+            _TL.con = con
+        return con
+
+    state = {}
 
     SEARCH_PER = 30          # 普通检索：每页条数
     SEASON_PER = 8           # 整季视图：每页集数
 
-    PAGE = """<!doctype html><html lang="zh"__THEME__><head><meta charset="utf-8">
+    # 内联 SVG 图标（data URI）。没有它浏览器会去要 /favicon.ico，
+    # 那个请求会落进 404 分支，日志里白白多一堆噪音。
+    FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
+               "viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' "
+               "fill='%232f6fed'/%3E%3Ccircle cx='14' cy='14' r='6.2' fill='none' "
+               "stroke='white' stroke-width='2.6'/%3E%3Cpath d='M18.6 18.6 24 24' "
+               "stroke='white' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E")
+
+    # 错误页。刻意不走 send_error()：它把 reason 塞进 HTTP 状态行，
+    # 而状态行只能放 latin-1，中文会抛 UnicodeEncodeError ——
+    # 结果连错误响应都发不出去，客户端只看到连接被断开。
+    ERRPAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>本地语料检索</title>
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="__FAVICON__">
+<title>__CODE__ · 本地语料检索</title>
+<style>
+:root{--bg:#14161a;--card:#1a1d23;--line:#262a31;--fg:#e8eaed;--fg2:#8b94a3;
+  --accent:#2f6fed;color-scheme:dark}
+@media (prefers-color-scheme:light){:root{--bg:#f5f6f8;--card:#fff;--line:#e4e7ec;
+  --fg:#101828;--fg2:#667085;color-scheme:light}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.65 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;
+  background:var(--bg);color:var(--fg)}
+main{max-width:560px;margin:0 auto;padding:56px 24px}
+.code{font-family:ui-monospace,Menlo,monospace;font-size:42px;font-weight:700;
+  letter-spacing:2px;margin:0 0 4px;color:var(--fg2)}
+h1{font-size:20px;font-weight:600;margin:0 0 14px}
+p{margin:0 0 12px;color:var(--fg2)}
+.detail{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;word-break:break-all;
+  background:var(--card);border:1px solid var(--line);border-radius:9px;padding:11px 14px}
+a.back{display:inline-block;margin-top:8px;text-decoration:none;background:var(--accent);
+  color:#fff;padding:9px 18px;border-radius:9px;font-weight:600}
+a.back:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+</style></head><body><main>
+<p class="code">__CODE__</p>
+<h1>__TITLE__</h1>
+__DETAIL__
+__HINT__
+<p><a class="back" href="/">← 返回检索页</a></p>
+</main></body></html>"""
+
+    PAGE = """<!doctype html><html lang="zh-CN"__THEME__><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#14161a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="description" content="本地字幕归档检索：按片名、文件名或季集号查找，支持整季打包下载。">
+<link rel="icon" href="__FAVICON__">
+<title>__TITLE__</title>
 <script>
 (function(){
   var K='corpus-theme', saved=null;
@@ -1916,8 +1982,8 @@ def cmd_serve(args):
   document.documentElement.setAttribute('data-theme', t);
   function label(){ var b=document.getElementById('themebtn');
     if(b){ var l=document.documentElement.getAttribute('data-theme')==='light';
-           b.textContent = l ? '\\u263E' : '\\u2600';
-           b.title = l ? '切换到暗色' : '切换到亮色'; } }
+           var t = l ? '切换到暗色主题' : '切换到亮色主题';
+           b.title = t; b.setAttribute('aria-label', t); } }
   window.__toggleTheme=function(){
     var n = document.documentElement.getAttribute('data-theme')==='light' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', n);
@@ -1959,15 +2025,22 @@ def cmd_serve(args):
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.55 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;
      background:var(--bg);color:var(--fg);transition:background .18s,color .18s}
-header{padding:20px 24px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;
+header{padding:18px 24px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;
        background:var(--hdr);backdrop-filter:blur(12px);z-index:5}
+.bar{max-width:1072px;margin:0 auto}
 .hrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.brand{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0}
 h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.3px}
-h1 span{color:var(--fg3);font-weight:400;font-size:13px;margin-left:8px}
+.count{flex:0 0 auto;font-size:12px;color:var(--fg3);background:var(--input);
+  border:1px solid var(--line);border-radius:999px;padding:2px 10px;white-space:nowrap}
 button.theme{background:var(--card);color:var(--fg);border:1px solid var(--line2);
   width:38px;height:38px;border-radius:10px;font-size:17px;line-height:1;cursor:pointer;
   padding:0;flex:0 0 auto;transition:border-color .15s,background .15s}
-button.theme:hover{border-color:var(--accent);background:var(--card)}
+button.theme:hover{border-color:var(--accent)}
+/* 明暗两种图标都写在 HTML 里，用 CSS 切换 —— 避免 JS 未执行时按钮一片空白 */
+.theme .ico-moon{display:none}
+:root[data-theme="light"] .theme .ico-sun{display:none}
+:root[data-theme="light"] .theme .ico-moon{display:inline}
 form{display:flex;gap:8px;flex-wrap:wrap}
 input[type=search],select{background:var(--input);border:1px solid var(--line2);color:var(--fg);
   padding:9px 12px;border-radius:9px;font-size:14px;outline:none}
@@ -1976,7 +2049,9 @@ input[type=search]:focus,select:focus{border-color:var(--accent)}
 button.go{background:var(--accent);color:var(--on-accent);border:0;padding:9px 18px;
   border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}
 button.go:hover{background:var(--accent-h)}
-main{padding:18px 24px 60px}
+main{padding:18px 24px 40px;max-width:1120px;margin:0 auto}
+footer{padding:0 24px 40px;max-width:1120px;margin:0 auto;
+  color:var(--fg4);font-size:12px;line-height:1.7}
 .hint{color:var(--fg3);font-size:13px;padding:8px 0}
 .hint a{color:var(--link)}
 
@@ -2003,38 +2078,13 @@ a.dl.alt{background:var(--input);color:var(--fg2);border:1px solid var(--line2)}
 a.dl.alt:hover{background:var(--card);color:var(--fg)}
 
 /* 整季视图 */
-.banner{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;
-  padding:14px 16px;margin-bottom:14px;border-radius:11px;
-  background:linear-gradient(100deg,var(--bn1),var(--bn2));border:1px solid var(--bn-line)}
-.banner b{font-size:15px}
-.banner small{display:block;color:var(--fg2);margin-top:3px;font-weight:400}
-.banner .acts{display:flex;gap:8px;flex-wrap:wrap}
-a.pack{text-decoration:none;background:var(--accent);color:var(--on-accent);padding:9px 18px;
-  border-radius:9px;font-size:14px;font-weight:700;white-space:nowrap}
-a.pack:hover{background:var(--accent-h)}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px;
   font-size:13px;color:var(--fg3)}
 .toolbar a{color:var(--link);text-decoration:none}
 .toolbar a:hover{text-decoration:underline}
 
-.epblock{margin-bottom:14px;border:1px solid var(--line);border-radius:11px;
-  background:var(--card);overflow:hidden;box-shadow:var(--shadow)}
 .ephead{display:flex;gap:10px;align-items:center;padding:10px 14px;
   background:var(--input);border-bottom:1px solid var(--line)}
-.ephead .no{font-weight:700;color:var(--link);font-family:ui-monospace,Menlo,monospace;
-  font-size:14px;min-width:64px}
-.ephead .cnt{color:var(--fg3);font-size:12.5px;flex:1}
-.ver{display:flex;gap:10px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line);
-  font-size:13px}
-.ver:last-child{border-bottom:0}
-.ver:hover{background:var(--input)}
-.ver.best{background:linear-gradient(90deg,var(--bn1),transparent 60%)}
-.ver .star{color:var(--star);flex:0 0 auto;width:14px;text-align:center;font-size:12px}
-.ver .vpath{flex:1;min-width:0;color:var(--fg2);font-family:ui-monospace,Menlo,monospace;
-  font-size:12.5px;word-break:break-all}
-.ver .vsize{color:var(--fg4);font-size:12px;white-space:nowrap;flex:0 0 auto}
-.ver .badge{min-width:40px;font-size:11.5px;padding:2px 6px}
-.ver .act a.dl{padding:5px 11px;font-size:12.5px}
 
 /* ---- 视图切换 ---- */
 .tabs{display:flex;gap:2px;margin:0 0 18px;border-bottom:1px solid var(--line)}
@@ -2144,26 +2194,86 @@ h1 a:hover{color:var(--link)}
 .pg:hover{border-color:var(--accent);color:var(--fg)}
 .pg.cur{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:700}
 .pgd{color:var(--fg4);padding:0 2px}
+
+/* ---- 无障碍：跳转链接 / 视觉隐藏 / 焦点态 ---- */
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip-path:inset(50%);white-space:nowrap;border:0}
+.skip{position:absolute;left:8px;top:-56px;z-index:20;background:var(--accent);
+  color:var(--on-accent);padding:10px 16px;border-radius:9px;text-decoration:none;
+  font-weight:600;transition:top .12s}
+.skip:focus{top:8px}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
+summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+summary:focus-visible{outline-offset:-2px}
+
+/* ---- 首页引导（没有查询词时） ---- */
+.welcome{max-width:640px;padding:4px 0}
+.welcome h2{margin:0 0 10px;font-size:18px;font-weight:600;letter-spacing:.2px}
+.welcome p{margin:0 0 8px;color:var(--fg2);font-size:13.5px;line-height:1.75}
+.welcome ul{margin:4px 0 12px;padding-left:20px;color:var(--fg2);font-size:13.5px;line-height:2}
+.welcome code{background:var(--input);border:1px solid var(--line);border-radius:6px;
+  padding:1px 6px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--fg)}
+.welcome .tip{color:var(--fg4);font-size:12.5px;margin:0}
+
+/* ---- 窄屏 ---- */
+@media (max-width:640px){
+  header{padding:14px 14px 12px}
+  main,footer{padding-left:14px;padding-right:14px}
+  .hrow{gap:8px}
+  h1{font-size:16px}
+  .brand{gap:8px}
+  input[type=search]{flex:1 1 100%;min-width:0}
+  button.go{flex:1 1 auto}
+  .row{flex-wrap:wrap}
+  .act{width:100%;justify-content:flex-end}
+  .ver{flex-wrap:wrap;gap:8px}
+  .ver .vpath{flex:1 1 160px}
+  .ephead .prev{display:none}
+  .seasrow{flex-wrap:wrap;gap:10px}
+  .sright{width:100%}
+  .sright .btn{flex:1 1 auto;text-align:center}
+  .head h2{font-size:17px}
+}
+/* 尊重系统「减少动态效果」 */
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important;animation:none!important}
+  .skip{transition:none}
+}
 </style></head><body>
+<a class="skip" href="#main">跳到主内容</a>
 <header>
-  <div class="hrow">
-    <h1><a href="/" title="回到首页，清空检索">本地语料检索</a> <span>__COUNT__ 条记录已索引</span></h1>
-    <button id="themebtn" class="theme" onclick="__toggleTheme()" aria-label="切换明暗主题"></button>
+  <div class="bar">
+    <div class="hrow">
+      <div class="brand">
+        <h1><a href="/" title="回到首页，清空检索">本地语料检索</a></h1>
+        <span class="count" title="已索引的字幕记录条数">__COUNT__ 条已索引</span>
+      </div>
+      <button id="themebtn" class="theme" type="button" onclick="__toggleTheme()"
+              aria-label="切换明暗主题" title="切换明暗主题"><span class="ico-sun"
+              aria-hidden="true">&#9728;</span><span class="ico-moon"
+              aria-hidden="true">&#9790;</span></button>
+    </div>
+    <form method="get" action="/" role="search">
+      <label class="sr" for="q">检索词</label>
+      <input id="q" type="search" name="q" value="__Q__" autofocus autocomplete="off"
+             enterkeyhint="search"
+             placeholder="片名 / 文件名关键词；带季号可看整季，例如 某某剧 S08">
+      <label class="sr" for="lang">语言</label>
+      <select id="lang" name="lang">
+        <option value="">语言不限</option>
+        <option value="chs"__S1__>简体</option>
+        <option value="chs_eng"__S2__>简英双语</option>
+        <option value="cht"__S3__>繁体</option>
+        <option value="cht_eng"__S4__>繁英双语</option>
+        <option value="eng"__S5__>英文</option>
+      </select>
+      <button class="go" type="submit">搜索</button>
+    </form>
   </div>
-  <form method="get" action="/">
-    <input type="search" name="q" placeholder="片名 / 文件名关键词；带季号可看整季，例如 某某剧 S08"
-           value="__Q__" autofocus>
-    <select name="lang">
-      <option value="">语言不限</option>
-      <option value="chs"__S1__>简体</option>
-      <option value="chs_eng"__S2__>简英双语</option>
-      <option value="cht"__S3__>繁体</option>
-      <option value="cht_eng"__S4__>繁英双语</option>
-      <option value="eng"__S5__>英文</option>
-    </select>
-    <button class="go" type="submit">搜索</button>
-  </form>
-</header><main>__BODY__</main></body></html>"""
+</header>
+<main><span id="main" tabindex="-1"></span>__BODY__</main>
+<footer>本地索引工具 · 检索与下载全部在本机完成，不联网、不外发数据</footer>
+</body></html>"""
 
     # ------------------------------------------------------------------
     def _page_bar(base, page, pages):
@@ -2196,12 +2306,37 @@ h1 a:hover{color:var(--link)}
         out.append("</div>")
         return "".join(out)
 
-    def _shell(q, lang, body, theme=None):
+    def page_title(q):
+        """标签页标题带上查询词 —— 浏览器历史与收藏夹里一眼能认出。"""
+        t = (q or "").strip()
+        return f"{t} · 本地语料检索" if t else "本地语料检索"
+
+    def _welcome():
+        """空查询时的首页引导。以前这里什么都不显示，进来是一片空白。"""
+        return ('<div class="welcome">'
+                '<h2>按名字找字幕，按整季打包</h2>'
+                '<p>输入片名或文件名里的关键词即可。中英文名都认，'
+                '也能直接写季集号。</p>'
+                '<ul>'
+                '<li>单集 —— <code>老友记 S01E01</code>、'
+                '<code>breaking bad s01e01</code></li>'
+                '<li>整季 —— <code>权力的游戏 S08</code>，'
+                '再选「整季下载」或「分集下载」</li>'
+                '<li>剧集总览 —— 只写剧名 <code>黑镜</code>，'
+                '会列出每一季</li>'
+                '</ul>'
+                '<p class="tip">支持中文名、英文名与 SxxExx 季集号；'
+                '特别篇归在「特别篇」一栏。</p>'
+                '</div>')
+
+    def _shell(q, lang, body, theme=None, title=None):
         page = PAGE
+        page = page.replace("__FAVICON__", FAVICON)
         page = page.replace("__THEME__",
                             f' data-theme="{theme}"' if theme in ("light", "dark") else "")
         page = page.replace("__COUNT__", "{:,}".format(state["n"]))
         page = page.replace("__Q__", html.escape(q or ""))
+        page = page.replace("__TITLE__", html.escape(title or page_title(q)))
         for i, v in enumerate(["chs", "chs_eng", "cht", "cht_eng", "eng"], 1):
             page = page.replace(f"__S{i}__", " selected" if lang == v else "")
         page = page.replace("__BODY__", "".join(body))
@@ -2325,7 +2460,8 @@ h1 a:hover{color:var(--link)}
                             f' {len(o["pairs"])} 集</a>')
             body.append(f'<div class="note">还匹配到 {len(groups) - 1} 个相近分组，'
                         f'可能不是同一部剧：<div class="altrow">{"".join(alts)}</div></div>')
-        return _shell(q, lang, body, theme)
+        return _shell(q, lang, body, theme,
+                      title=f'《{label}》{season_title(season)}')
 
     def _tabs(q, lang, season, active, theme=None):
         """整季下载 / 分集下载 两个视图的切换条。"""
@@ -2345,7 +2481,7 @@ h1 a:hover{color:var(--link)}
 
         只在这部剧确实不止一季（或有特别篇）时才给 —— 单季剧点了会原地打转。
         """
-        n = state["con"].execute(
+        n = db().execute(
             "SELECT count(DISTINCT season) FROM subs WHERE series_key=? OR series_key LIKE ?",
             (series_q, series_q + ".%")).fetchone()[0]
         if n < 2:
@@ -2392,14 +2528,12 @@ h1 a:hover{color:var(--link)}
             body.append(f'<div class="note">「{html.escape(q)}」还匹配到 '
                         f'{len(overview) - 1} 个相近的分组，可能不是同一部剧：'
                         f'<div class="altrow">{"".join(alts)}</div></div>')
-        return _shell(q, lang, body, theme)
+        return _shell(q, lang, body, theme, title=f'《{g["label"]}》')
 
     def render_versions(q, lang, video, season, group, theme=None):
         """整季下载视图：一个发布版本 = 一个结果，按语言分别打包。"""
         series_q = group["series_key"] or q
-        vers = season_versions(state["con"], video, season)
-        if group.get("lang_pref"):
-            pass
+        vers = season_versions(db(), video, season)
 
         body = [_crumb(series_q, group["label"], lang, theme),
                 _tabs(series_q, lang, season, "season", theme)]
@@ -2415,7 +2549,7 @@ h1 a:hover{color:var(--link)}
                     '720p / 1080p 指字幕对应的片源版本，不影响能否使用；'
                     '因此推荐以「覆盖是否完整」为准，而非画质。</div>')
 
-        rec = recommend_season(state["con"], video, season)
+        rec = recommend_season(db(), video, season)
         if rec["kind"] != "none":
             if rec["kind"] == "version":
                 head = (f'<span class="star">★</span>推荐整季包'
@@ -2478,7 +2612,8 @@ h1 a:hover{color:var(--link)}
                             '所以各集的发布版本可能不一致。要每集自己挑，请用「分集下载」。'
                             f'<div class="langrow" style="padding:12px 0 0">{"".join(btns)}</div>'
                             '</div>')
-            return _shell(q, lang, body, theme)
+            return _shell(q, lang, body, theme,
+                          title=f'《{group["label"]}》{season_title(season)}')
 
         for i, v in enumerate(vers, 1):
             partial = v["coverage"] < v["total"]
@@ -2509,7 +2644,8 @@ h1 a:hover{color:var(--link)}
                 f'<span class="vcov">{cov}{warn}</span></div>'
                 f'<div class="langrow">{"".join(btns)}</div></div>')
 
-        return _shell(q, lang, body, theme)
+        return _shell(q, lang, body, theme,
+                      title=f'《{group["label"]}》{season_title(season)}')
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -2558,16 +2694,22 @@ h1 a:hover{color:var(--link)}
                            "storage/logs/server.log")
 
         def _fail(self, code, title, detail="", hint=""):
-            """自己拼一个 UTF-8 的错误页，不走 send_error（状态行放不下中文）。"""
+            """UTF-8 的中文错误页。
+
+            不能用 send_error()：它把 reason 塞进 HTTP 状态行，而状态行只能放
+            latin-1，中文会抛 UnicodeEncodeError —— 结果连错误响应都发不出去，
+            客户端只看到连接被断开。
+            """
             try:
-                body = (f'<!doctype html><html lang="zh"><meta charset="utf-8">'
-                        f'<title>{code}</title>'
-                        f'<body style="font:15px/1.6 -apple-system,sans-serif;'
-                        f'padding:40px;max-width:640px;margin:auto">'
-                        f'<h2>{html.escape(title)}</h2>'
-                        f'<p style="color:#888">{html.escape(detail)}</p>'
-                        f'<p>{html.escape(hint)}</p></body>')
-                data = body.encode("utf-8")
+                page = (ERRPAGE
+                        .replace("__FAVICON__", FAVICON)
+                        .replace("__CODE__", str(code))
+                        .replace("__TITLE__", html.escape(title))
+                        .replace("__DETAIL__",
+                                 f'<p class="detail">{html.escape(detail)}</p>'
+                                 if detail else "")
+                        .replace("__HINT__", f"<p>{html.escape(hint)}</p>" if hint else ""))
+                data = page.encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -2589,14 +2731,16 @@ h1 a:hover{color:var(--link)}
                 if qs.get("merge", ["0"])[0] == "1":
                     fam = None
                 if not q or not season.isdigit():
-                    self.send_error(400, "missing q/season")
+                    self._fail(400, "这个下载链接不完整", "",
+                               "请回到检索页，重新选择要下载的那一季。")
                     return
                 v = parse_video_name(q)
                 pref = {lang} if lang else None
-                data, manifest = build_season_zip(state["con"], v, int(season), pref,
+                data, manifest = build_season_zip(db(), v, int(season), pref,
                                                   variants=allv, family=fam)
                 if not data:
-                    self.send_error(404, "no files for this season")
+                    self._fail(404, "这一季没有可打包的文件", "",
+                               "换一种语言筛选试试，或改用「分集下载」逐集挑。")
                     return
                 self._send(data, "application/zip", f"S{int(season):02d}.zip")
                 return
@@ -2605,19 +2749,30 @@ h1 a:hover{color:var(--link)}
                 fullpath = qs.get("fp", [""])[0]
                 inner = qs.get("ip", [""])[0]
                 conv = qs.get("conv", ["0"])[0] == "1"
-                r = state["con"].execute(
+                r = db().execute(
                     "SELECT * FROM subs WHERE fullpath=? AND inner_path=?",
                     (fullpath, inner)).fetchone()
                 if not r:
-                    self.send_error(404)
+                    self._fail(404, "找不到这条字幕记录", Path(inner).name,
+                               "它可能已经不在索引里了 —— 回到检索页重搜一次。")
                     return
-                tmp = Path(tempfile.mkdtemp()) / Path(inner).name
+                # 解包要落到临时文件。以前这里从不清理，每下载一次就在
+                # 系统临时目录里留下一个目录 + 一个文件，跑久了能把盘塞满。
+                tmpdir = Path(tempfile.mkdtemp(prefix="corpus-get-"))
                 try:
-                    materialize(state["con"], dict(r), tmp)
+                    tmp = tmpdir / Path(inner).name
+                    materialize(db(), dict(r), tmp)
+                    data = tmp.read_bytes()
                 except Exception as e:
-                    self.send_error(500, str(e))
+                    # 注意别把异常原文塞进 HTTP 状态行：materialize 抛的是中文
+                    # RuntimeError，状态行只放得下 latin-1，会再抛 UnicodeEncodeError，
+                    # 连这个错误页都发不出去。
+                    self._fail(500, "取出这个字幕文件失败",
+                               f"{type(e).__name__}: {e}",
+                               "归档可能被移动或损坏了。回到检索页另选一个版本试试。")
                     return
-                data = tmp.read_bytes()
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
                 fn = Path(inner).name
                 if conv:
                     data, enc = normalize_text_bytes(data)
@@ -2626,13 +2781,20 @@ h1 a:hover{color:var(--link)}
                 self._send(data, "application/octet-stream", fn)
                 return
 
+            # 只认首页。以前任何未知路径都会掉进下面「没有查询词」的分支，
+            # 于是 /favicon.ico、/foo 统统返回 200 + 一个首页，既误导又难看。
+            if u.path not in ("/", "/index.html"):
+                self._fail(404, "页面不存在", u.path,
+                           "地址可能输错了，或者这个链接已经失效。")
+                return
+
             q = (qs.get("q", [""])[0] or "").strip()
             lang = qs.get("lang", [""])[0]
             theme = (qs.get("theme", [""])[0] or "").strip().lower() or None
             if theme not in ("light", "dark"):
                 theme = None
             if not q:
-                self._send(_shell("", lang, [], theme), "text/html; charset=utf-8")
+                self._send(_shell("", lang, [_welcome()], theme), "text/html; charset=utf-8")
                 return
 
             v = parse_video_name(q)
@@ -2646,7 +2808,7 @@ h1 a:hover{color:var(--link)}
                 sv = dict(v)
                 sv["season"] = want_season
                 sv["episode"] = None
-                groups = season_groups(state["con"], sv, want_season, pref)
+                groups = season_groups(db(), sv, want_season, pref)
                 if groups:
                     view = (qs.get("view", ["season"])[0] or "season").lower()
                     if view in ("season", "pack"):
@@ -2663,7 +2825,7 @@ h1 a:hover{color:var(--link)}
 
             # 2) 只有剧名（没有季集）-> 按季总览
             if v["season"] is None and (v["series_key"] or v.get("cjk")):
-                overview = series_overview(state["con"], v, pref)
+                overview = series_overview(db(), v, pref)
                 if len(overview) == 1 and len(overview[0]["seasons"]) == 1:
                     # 只有一季就别多一层了，直接进按集视图
                     se, pairs, _pk = overview[0]["seasons"][0]
@@ -2683,7 +2845,7 @@ h1 a:hover{color:var(--link)}
                                "text/html; charset=utf-8")
                     return
 
-            rows = find_candidates(state["con"], v, limit=200, lang_pref=pref)
+            rows = find_candidates(db(), v, limit=200, lang_pref=pref)
             ep_txt = ""
             if v["season"] is not None:
                 ep_txt = f" S{v['season']:02d}E{(v['episode'] or 0):02d}"
@@ -2696,8 +2858,19 @@ h1 a:hover{color:var(--link)}
             self._send(render(q, lang, rows, note, page=page, theme=theme),
                        "text/html; charset=utf-8")
 
-    state["n"] = con.execute("SELECT count(*) FROM subs").fetchone()[0]
-    srv = ThreadingHTTPServer((args.host, args.port), H)
+    state["n"] = db().execute("SELECT count(*) FROM subs").fetchone()[0]
+
+    class Srv(ThreadingHTTPServer):
+        """socketserver 默认的 listen backlog 只有 5。
+
+        并发一多（连点刷新、多开几个标签页），内核就把排不进队列的连接直接
+        拒掉，客户端看到的是 ConnectionResetError —— 而页面明明好好的。
+        放宽到 64 就没这回事了。
+        """
+        daemon_threads = True
+        request_queue_size = 64
+
+    srv = Srv((args.host, args.port), H)
     url = f"http://{args.host}:{args.port}/"
     print(f"检索页已启动: {url}")
     print(f"索引 {state['n']:,} 条记录。Ctrl-C 退出。")
